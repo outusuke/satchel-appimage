@@ -168,6 +168,40 @@ def icon_problem(path):
     return None
 
 
+def png_size(path):
+    """(width, height) read from a PNG header, or None."""
+    try:
+        with open(path, "rb") as f: head = f.read(24)
+    except OSError: return None
+    if head[:8] != b"\x89PNG\r\n\x1a\n" or head[12:16] != b"IHDR": return None
+    return struct.unpack(">II", head[16:24])
+
+
+def find_icon(folder, min_px=48, depth=4, limit=3000):
+    """The best icon inside a program folder, or None: a .svg if there is one (shallowest first, not a -symbolic one),
+    otherwise the largest real .png of at least min_px (read from the image header, not the file name). Looks at most
+    depth folders down and at most limit files."""
+    base, svgs, pngs, seen = os.path.realpath(folder), [], [], 0
+    if not os.path.isdir(base): return None
+    for root, dirs, files in os.walk(base):
+        level = root[len(base):].count(os.sep)
+        if level >= depth: dirs[:] = []
+        dirs.sort()
+        for fn in sorted(files):
+            seen += 1
+            if seen > limit: break
+            path, ext = os.path.join(root, fn), os.path.splitext(fn)[1].lower()
+            if ext not in ICON_EXT or os.path.islink(path) or icon_problem(path): continue
+            if ext == ".svg":
+                if "-symbolic" not in fn.lower(): svgs.append((level, path))
+            else:
+                size = png_size(path)
+                if size and min(size) >= min_px: pngs.append((-min(size), level, path))
+        if seen > limit: break
+    if svgs: return min(svgs)[1]
+    return min(pngs)[2] if pngs else None
+
+
 def find_executables(folder):
     """Executable files at most two folders deep, as paths relative to folder (shallowest first, no .so files, no links
     that lead outside the folder)."""
@@ -750,7 +784,7 @@ def cli(argv):
     p.add_argument("source", help="the program file, or the folder that holds the program")
     p.add_argument("--name", help="app name (default: the file or folder name)")
     p.add_argument("--exe", default="", help="for a folder: the program to start, relative to the folder")
-    p.add_argument("--icon", help="a .png or .svg file")
+    p.add_argument("--icon", help="a .png or .svg file (default: the best one found inside the folder)")
     p.add_argument("--category", default="Utility", choices=CATEGORIES)
     p.add_argument("--version", default="", help="goes into the file name and the desktop file")
     p.add_argument("--comment", default="", help="a short description for the desktop file")
@@ -766,6 +800,9 @@ def cli(argv):
     name = a.name or default_name(os.path.realpath(a.source))
     log = (lambda line: print(line, file=sys.stderr)) if a.verbose else None
     note = packing_notes(a.source, a.exe)
+    if not a.icon and os.path.isdir(a.source):
+        a.icon = find_icon(a.source)
+        if a.icon: print(f"Icon found in the folder: {a.icon}", file=sys.stderr)
     try:
         if a.dry_run:
             ident, desktop, apprun = preview(a.source, name, a.exe, a.icon, a.category, a.terminal, a.version, a.comment)
@@ -795,7 +832,7 @@ def run_gui():
         def __init__(self, app):
             super().__init__(application=app, title="Satchel", default_width=560, default_height=760)
             self.saved = load_settings()
-            self.src, self.icon, self.exes = None, None, []
+            self.src, self.icon, self.exes, self.icon_auto = None, None, [], False
             self.auto_name = ""                         # the name last suggested from the program (see auto_name)
             self.last_dir = self.saved.get("last_dir")  # where the file dialogs open next
             self.out_dir = self.saved.get("out_dir", os.path.expanduser("~"))
@@ -921,7 +958,7 @@ def run_gui():
         def set_icon(self, path):
             why = icon_problem(path)
             if why: return self.alert("Can't use that icon", why)
-            self.icon = path; self.icon_row.set_subtitle(path); self.remember(path)
+            self.icon = path; self.icon_auto = False; self.icon_row.set_subtitle(path); self.remember(path)
 
         def show_folder(self, path):
             try:
@@ -1024,6 +1061,9 @@ def run_gui():
             if is_dir and not self.exes: self.alert("No program found", "That folder has no executable file in it (two levels deep).")
             new = default_name(path)
             self.name_row.set_text(auto_name(self.name_row.get_text(), self.auto_name, new)); self.auto_name = new
+            if is_dir and (self.icon is None or self.icon_auto):                # never replaces an icon you chose
+                found = find_icon(path)
+                if found: self.icon, self.icon_auto = found, True; self.icon_row.set_subtitle(found + "  (found in the folder)")
             self.remember(path)
 
         def choose_icon(self):

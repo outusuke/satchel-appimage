@@ -574,6 +574,19 @@ class Logic(unittest.TestCase):
             self.assertNotIn("--share-net", a)
         self.assertEqual(M["display_args"]({}), ([], []))                    # no screen: nothing is added
 
+    def test_find_icon_prefers_svg_then_the_largest_png(self):
+        with tempfile.TemporaryDirectory() as d:
+            ic = os.path.join(d, "browser", "icons"); os.makedirs(ic)
+            M["placeholder_icon"](os.path.join(ic, "default256.png"))              # 256 px, real PNG
+            open(os.path.join(ic, "tiny.png"), "wb").write(b"\x89PNG\r\n\x1a\n" + b"x" * 40)   # not a real header: skipped
+            open(os.path.join(ic, "fake.png"), "w").write("text")
+            self.assertEqual(M["find_icon"](d), os.path.join(ic, "default256.png"))
+            svg = os.path.join(d, "app.svg"); open(svg, "w").write("<svg></svg>")
+            self.assertEqual(M["find_icon"](d), svg)
+            os.rename(svg, os.path.join(d, "app-symbolic.svg"))
+            self.assertEqual(M["find_icon"](d), os.path.join(ic, "default256.png"))
+        with tempfile.TemporaryDirectory() as d: self.assertIsNone(M["find_icon"](d))
+
     def test_describe_run_explains_the_usual_causes(self):
         d = M["describe_run"]
         self.assertIn("exec format error", d(126, "bash: x: cannot execute: Exec format error", False, 5, False).lower())

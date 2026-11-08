@@ -21,6 +21,8 @@ seconds. **Ctrl+B** builds.
     satchel PROGRAM [--name N] [--exe E] [--icon I] [--category C] [--version V] [--comment T]
                          [--terminal] [--out DIR] [--sandbox] [--try [--seconds S]] [--dry-run] [-v]
 
+If you give a folder and no icon, the best one inside it is used (an `.svg`, else the largest `.png`).
+
 `--dry-run` prints the files that would be made and builds nothing. `--try` only starts the program to see that it works.
 
 ## Tests
@@ -28,10 +30,6 @@ seconds. **Ctrl+B** builds.
     python3 test_satchel.py
 
 The tests need neither GTK nor a real appimagetool.
-
-## License
-
-GPL-3.0-or-later. See [LICENSE](LICENSE).
 
 ## License
 
