@@ -1,0 +1,1102 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Your Name
+# satchel - GTK4 + libadwaita front end for appimagetool: pick a program, name it, pick an icon, build an .AppImage.
+# It packs exactly what you give it. It does NOT copy in shared libraries, so the result runs where those libraries exist.
+# Needs the appimagetool program: put it in your PATH (see README).
+# Usage: satchel                      (opens the window)
+#        satchel PROGRAM [--name N] [--exe E] [--icon I] [--category C] [--version V] [--comment T] [--terminal]
+#                             [--out DIR] [--sandbox] [--try [--seconds S]] [--dry-run] [-v]
+import collections, glob, hashlib, json, os, platform, re, shlex, shutil, signal, struct, subprocess, sys, tempfile, threading, time, unicodedata, zlib
+
+CATEGORIES = ["Utility", "Development", "Graphics", "Network", "AudioVideo", "Office", "Game", "Education",
+              "Science", "System", "Settings"]
+ICON_EXT = (".png", ".svg")
+TOOL_URL = "https://github.com/AppImage/appimagetool/releases"
+APP_VERSION = "1.1"
+
+
+class BuildError(Exception):
+    pass
+
+
+class Cancelled(BuildError):
+    """The person stopped the build; not an error to show."""
+
+
+OS_RELEASE = "/etc/os-release"
+SETTINGS = os.path.expanduser("~/.config/satchel/settings.json")
+
+
+def install_hint(pkg):
+    """The command that installs pkg on this distribution, guessed from /etc/os-release (dnf when unknown)."""
+    ids = []
+    try:
+        with open(OS_RELEASE) as f:
+            for line in f:
+                k, _, v = line.partition("=")
+                if k in ("ID", "ID_LIKE"): ids += v.strip().strip('"').lower().split()
+    except OSError: pass
+    for i in ids:
+        if i in ("debian", "ubuntu"): return f"sudo apt install {pkg}"
+        if i in ("arch", "manjaro"): return f"sudo pacman -S {pkg}"
+        if i in ("suse", "sles") or i.startswith("opensuse"): return f"sudo zypper install {pkg}"
+    return f"sudo dnf install {pkg}"
+
+
+def load_settings(path=None):
+    """The choices saved from the last run. Each value is checked; anything missing or wrong is left out."""
+    try:
+        with open(path or SETTINGS) as f: raw = json.load(f)
+    except (OSError, ValueError): return {}
+    if not isinstance(raw, dict): return {}
+    out = {}
+    if isinstance(raw.get("out_dir"), str) and os.path.isdir(raw["out_dir"]): out["out_dir"] = raw["out_dir"]
+    if isinstance(raw.get("last_dir"), str) and os.path.isdir(raw["last_dir"]): out["last_dir"] = raw["last_dir"]
+    if raw.get("category") in CATEGORIES: out["category"] = raw["category"]
+    for k in ("terminal", "sandbox"):
+        if isinstance(raw.get(k), bool): out[k] = raw[k]
+    return out
+
+
+def save_settings(data, path=None):
+    """Remember the choices. This is a convenience, so a failure to write is ignored and never stops a build."""
+    path = path or SETTINGS
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path + ".new", "w") as f: json.dump(data, f, indent=1)
+        os.replace(path + ".new", path)
+    except OSError: pass
+
+
+def clean(n):
+    """A safe file name: letters, digits, dot, dash, underscore. Accents are dropped (Café -> Cafe). A name with no usable
+    letters at all (日本語, ...) becomes app-<short hash of the name>, so different names do not end up as the same file."""
+    plain = "".join(c for c in unicodedata.normalize("NFKD", n) if not unicodedata.combining(c))
+    out = re.sub(r"[^A-Za-z0-9._-]", "_", plain).lstrip("._-")[:64]
+    if out.strip("_"): return out
+    return "app-" + hashlib.sha1(n.encode("utf-8", "replace")).hexdigest()[:6] if n.strip(". _-") else "app"
+
+
+def desktop_text(v):
+    """A value for a .desktop file: a backslash is the escape character there, so it is doubled."""
+    return v.replace("\\", "\\\\")
+
+
+def default_name(path):
+    """The app name suggested for a program: a file's name without its extension, a folder's name as it is."""
+    p = path.rstrip("/") or path
+    return os.path.basename(p) if os.path.isdir(p) else os.path.splitext(os.path.basename(p))[0]
+
+
+def auto_name(current, previous, new):
+    """What the Name box should say after the program changed. The new suggestion goes in when the box is empty or still
+    shows the last suggestion; text the person typed or edited is kept."""
+    return new if not current.strip() or current == previous else current
+
+
+BIG_FOLDER = 1 << 30
+
+
+def folder_size(folder, limit=None):
+    """The total size in bytes of the files in a folder (links not followed); stops counting once it passes limit."""
+    total = 0
+    for root, _dirs, files in os.walk(folder):
+        for f in files:
+            try: total += os.lstat(os.path.join(root, f)).st_size
+            except OSError: pass
+            if limit and total > limit: return total
+    return total
+
+
+def size_note(src):
+    """A warning when the program folder is very big, or ''. The folder is copied once into the app folder and again into the image."""
+    if os.path.isdir(src) and folder_size(src, BIG_FOLDER) > BIG_FOLDER:
+        return ("Heads up: the program folder is over 1 GB. Building copies it twice, so it needs plenty of free disk space "
+                "and takes a while, and the AppImage will be big.")
+    return ""
+
+
+def outside_link(path, base):
+    """True when path is a symbolic link that would not work once the folder is packed: an absolute link, or one that
+    leads out of base (a folder, already resolved)."""
+    if not os.path.islink(path): return False
+    if os.path.isabs(os.readlink(path)): return True
+    real = os.path.realpath(path)
+    return not (real == base or real.startswith(base + os.sep))
+
+
+def outside_links(folder):
+    """Paths (relative to folder, sorted) of the symbolic links in it that point outside it or use an absolute path."""
+    base, out = os.path.realpath(folder), []
+    for root, dirs, files in os.walk(base):
+        for n in dirs + files:
+            p = os.path.join(root, n)
+            if outside_link(p, base): out.append(os.path.relpath(p, base))
+        dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(root, d))]
+    return sorted(out)
+
+
+def links_note(links):
+    """A warning about links that were left out of the AppImage, or '' when there are none."""
+    if not links: return ""
+    shown = ", ".join(links[:8]) + (f" and {len(links) - 8} more" if len(links) > 8 else "")
+    return ("Heads up: these symbolic links point outside the program folder (or use an absolute path), so they were "
+            "left out of the AppImage: " + shown + ". If the program needs them, copy the real files into the folder.")
+
+
+def packing_notes(src, exe):
+    """All the warnings for the result message (wrong kind of computer, missing libraries, links left out, very big
+    folder), joined;
+    '' when there are none."""
+    prog = os.path.join(src, exe) if os.path.isdir(src) else src
+    links = outside_links(src) if os.path.isdir(src) else []
+    notes = (arch_problem(prog) if os.path.isfile(prog) else "", missing_note(missing_libraries(src, exe)), links_note(links),
+             size_note(src))
+    return "\n\n".join(n for n in notes if n)
+
+
+def icon_problem(path):
+    """Why path cannot be used as an icon, or None. The file must really be a PNG or an SVG, whatever its name says."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in ICON_EXT or not os.path.isfile(path): return "The icon must be an existing .png or .svg file."
+    try:
+        with open(path, "rb") as f: head = f.read(4096)
+    except OSError as e: return f"Could not read the icon: {e}"
+    if ext == ".png" and head[:4] != b"\x89PNG": return "That file is named .png but is not a PNG image."
+    if ext == ".svg" and b"<svg" not in head.lower(): return "That file is named .svg but is not an SVG image."
+    return None
+
+
+def find_executables(folder):
+    """Executable files at most two folders deep, as paths relative to folder (shallowest first, no .so files, no links
+    that lead outside the folder)."""
+    base, out = os.path.realpath(folder), []
+    for root, dirs, files in os.walk(base):
+        if root[len(base):].count(os.sep) >= 2: dirs[:] = []
+        for f in files:
+            p = os.path.join(root, f)
+            if outside_link(p, base): continue
+            if os.path.isfile(p) and os.access(p, os.X_OK) and not (f.endswith(".so") or ".so." in f):
+                out.append(os.path.relpath(p, base))
+    return sorted(out, key=lambda r: (r.count(os.sep), r))
+
+
+def _is_lib(name):
+    return name.endswith(".so") or ".so." in name
+
+
+def library_dirs(folder):
+    """Folders inside the program folder (at most three deep) that hold shared libraries, as paths relative to it
+    ('.' is the folder itself), shallowest first. Names with a colon are skipped: they cannot go into LD_LIBRARY_PATH."""
+    base, out = os.path.realpath(folder), []
+    for root, dirs, files in os.walk(base):
+        rel = os.path.relpath(root, base)
+        depth = 0 if rel == "." else rel.count(os.sep) + 1
+        if depth >= 3: dirs[:] = []
+        if ":" not in rel and any(_is_lib(f) for f in files): out.append((depth, rel))
+    return [rel for _, rel in sorted(out)[:30]]
+
+
+def elf_dynamic(path):
+    """(shared libraries it asks for, folders from its RPATH/RUNPATH, machine number) for an ELF program, read straight
+    from the file without running it. ([], [], None) for anything that is not ELF or cannot be read; the machine number
+    is still given for a static program, which has no dynamic section."""
+    try:
+        with open(path, "rb") as f:
+            h = f.read(64)
+            if len(h) < 64 or h[:4] != b"\x7fELF" or h[4] not in (1, 2) or h[5] not in (1, 2): return [], [], None
+            e, wide = ("<" if h[5] == 1 else ">"), h[4] == 2
+            machine, = struct.unpack_from(e + "H", h, 0x12)
+            none = ([], [], machine)
+            if wide: phoff, = struct.unpack_from(e + "Q", h, 0x20); phsz, phnum = struct.unpack_from(e + "HH", h, 0x36)
+            else: phoff, = struct.unpack_from(e + "I", h, 0x1C); phsz, phnum = struct.unpack_from(e + "HH", h, 0x2A)
+            if not 0 < phnum <= 256 or phsz < 32: return none
+            f.seek(phoff)
+            raw = f.read(phsz * phnum)
+            loads, dyn = [], None
+            for i in range(phnum):
+                if wide: kind, _fl, off, vaddr, _pa, size, _ms, _al = struct.unpack_from(e + "IIQQQQQQ", raw, i * phsz)
+                else: kind, off, vaddr, _pa, size, _ms, _fl, _al = struct.unpack_from(e + "IIIIIIII", raw, i * phsz)
+                if kind == 1: loads.append((vaddr, off, size))
+                elif kind == 2: dyn = (off, size)
+            if not dyn or dyn[1] > 1024 * 1024: return none
+            f.seek(dyn[0])
+            data, step = f.read(dyn[1]), (16 if wide else 8)
+            names, paths, strtab = [], [], None
+            for i in range(0, len(data) - step + 1, step):
+                tag, val = struct.unpack_from(e + ("qQ" if wide else "iI"), data, i)
+                if tag == 0: break
+                if tag == 1: names.append(val)
+                elif tag in (15, 29): paths.append(val)             # DT_RPATH, DT_RUNPATH
+                elif tag == 5: strtab = val
+            if strtab is None: return none
+            base = next((off + strtab - vaddr for vaddr, off, size in loads if vaddr <= strtab < vaddr + size), None)
+            if base is None: return none
+            def text(n):
+                f.seek(base + n)
+                return f.read(1024).split(b"\0", 1)[0].decode("utf-8", "replace")
+            return [text(n)[:256] for n in names], [d for n in paths for d in text(n).split(":") if d], machine
+    except (OSError, struct.error):
+        return [], [], None
+
+
+def needed_libs(path):
+    """The shared libraries an ELF program asks for (its DT_NEEDED entries). Empty for scripts, static programs, anything
+    that is not ELF, or a file that cannot be read."""
+    return elf_dynamic(path)[0]
+
+
+MACHINES = {"x86_64": 62, "amd64": 62, "aarch64": 183, "arm64": 183, "i386": 3, "i486": 3, "i586": 3, "i686": 3,
+            "armv7l": 40, "armv8l": 40, "riscv64": 243, "ppc64le": 21, "ppc64": 21, "s390x": 22, "loongarch64": 258}
+MACHINE_NAMES = {62: "x86_64", 183: "aarch64", 3: "i686", 40: "arm", 243: "riscv64", 21: "ppc64", 22: "s390x", 258: "loongarch64"}
+
+
+def arch_problem(path, arch=None):
+    """A warning when path is an ELF program built for another kind of computer than this one, else ''. Scripts and
+    anything it cannot read give ''. The AppImage runtime is always made for this machine, so such a program cannot run in it."""
+    arch = arch or platform.machine()
+    want, have = MACHINES.get(arch), elf_dynamic(path)[2]
+    if not want or not have or have == want: return ""
+    return (f"Heads up: '{os.path.basename(path)}' is a program for {MACHINE_NAMES.get(have, 'machine type %d' % have)} "
+            f"computers, but this one is {arch}. The AppImage will not run on a {arch} computer.")
+
+
+def system_libraries():
+    """The names of the shared libraries this system has: from 'ldconfig -p' where that works, plus the usual folders."""
+    names = set()
+    ld = shutil.which("ldconfig") or next((p for p in ("/sbin/ldconfig", "/usr/sbin/ldconfig") if os.access(p, os.X_OK)), None)
+    if ld:
+        try:
+            r = subprocess.run([ld, "-p"], capture_output=True, text=True, errors="replace", stdin=subprocess.DEVNULL, timeout=20)
+            for line in r.stdout.splitlines():
+                if "=>" in line and line.split("=>")[0].split(): names.add(line.split("=>")[0].split()[0])
+        except (OSError, subprocess.TimeoutExpired): pass
+    for d in ("/lib", "/lib64", "/usr/lib", "/usr/lib64", "/usr/local/lib", "/usr/local/lib64",
+              *glob.glob("/lib/*-linux-*"), *glob.glob("/usr/lib/*-linux-*")):
+        try: names.update(os.listdir(d))
+        except OSError: pass
+    return names
+
+
+def missing_libraries(src, exe):
+    """Sorted names of shared libraries that the program (and the .so files packed with it) ask for but that are neither
+    inside the packed folder nor installed on this system. Folders named in a program's RPATH/RUNPATH count too: one
+    inside the packed folder ($ORIGIN/..., which travels with the AppImage) or an absolute one on this system.
+    Empty when there are none, or when it cannot tell."""
+    src = os.path.realpath(src)
+    scan, have, folder = [], set(), os.path.isdir(src)
+    try:
+        if os.path.isfile(src): scan = [src]
+        elif folder:
+            prog = os.path.realpath(os.path.join(src, exe or ""))
+            if not exe or not prog.startswith(src + os.sep) or not os.path.isfile(prog): return []
+            scan = [prog]
+            for rel in library_dirs(src):
+                d = os.path.join(src, rel)
+                for f in sorted(os.listdir(d)):
+                    have.add(f)
+                    if _is_lib(f) and os.path.isfile(os.path.join(d, f)) and len(scan) < 300: scan.append(os.path.join(d, f))
+        else: return []
+        wanted, seen = set(), set()
+        for p in scan:
+            names, paths, _ = elf_dynamic(p)
+            wanted.update(names)
+            for raw in paths:
+                origin = "$ORIGIN" in raw or "${ORIGIN}" in raw
+                d = raw.replace("${ORIGIN}", "$ORIGIN").replace("$ORIGIN", os.path.dirname(p))
+                if "$" in d or not os.path.isabs(d): continue            # $LIB, $PLATFORM and relative folders: cannot tell
+                d = os.path.realpath(d)
+                if origin and not (folder and (d == src or d.startswith(src + os.sep))): continue     # would not travel
+                if d in seen or len(seen) >= 30: continue
+                seen.add(d)
+                try: have.update(os.listdir(d))
+                except OSError: pass
+        wanted -= have
+    except OSError:
+        return []
+    return sorted(wanted - system_libraries()) if wanted else []
+
+
+def missing_note(missing):
+    """A warning for the result message, or '' when nothing is missing."""
+    if not missing: return ""
+    shown = ", ".join(missing[:12]) + (f" and {len(missing) - 12} more" if len(missing) > 12 else "")
+    return ("Heads up: these shared libraries were not found on this system or inside the packed folder: " + shown
+            + ". The AppImage will only run where they exist.")
+
+
+def placeholder_icon(dst):
+    """A plain 256x256 PNG square (appimagetool wants a PNG for .DirIcon)."""
+    n, bg, fg = 256, bytes((0x3B, 0x42, 0x52, 255)), bytes((0xEC, 0xEF, 0xF4, 255))
+    row = lambda y: b"\0" + b"".join(fg if 96 <= x < 160 and 96 <= y < 160 else bg for x in range(n))
+    def chunk(t, d): return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xFFFFFFFF)
+    png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", n, n, 8, 6, 0, 0, 0))
+           + chunk(b"IDAT", zlib.compress(b"".join(row(y) for y in range(n)))) + chunk(b"IEND", b""))
+    with open(dst, "wb") as f: f.write(png)
+
+
+def check_inputs(src, name, exe, icon, category, version="", comment=""):
+    """Check what the person gave. Returns (name, version, comment, clean name, program inside the folder, icon extension);
+    raises BuildError with a plain message when something is wrong."""
+    name, version, comment = name.strip(), version.strip(), comment.strip()
+    if not name or any(ord(c) < 32 for c in name): raise BuildError("Give the app a name (one line, no control characters).")
+    if any(ord(c) < 32 for c in version): raise BuildError("The version must be one line, no control characters.")
+    if any(ord(c) < 32 for c in comment): raise BuildError("The description must be one line, no control characters.")
+    if category not in CATEGORIES: raise BuildError(f"Unknown category '{category}'.")
+    src = os.path.realpath(src)
+    if os.path.isdir(src):
+        exe = os.path.normpath(exe or "")
+        if not exe or exe == "." or os.path.isabs(exe) or exe.startswith(".."): raise BuildError("Choose which program in the folder to start.")
+        if not (os.path.isfile(os.path.join(src, exe)) and os.access(os.path.join(src, exe), os.X_OK)):
+            raise BuildError(f"'{exe}' is not an executable file inside the folder.")
+    elif os.path.isfile(src):
+        if not os.access(src, os.X_OK): raise BuildError("That file is not executable (chmod +x it first).")
+        exe = os.path.basename(src)
+    else:
+        raise BuildError("Choose the program file or folder to pack.")
+    if icon:
+        ext = os.path.splitext(icon)[1].lower()
+        if icon_problem(icon): raise BuildError(icon_problem(icon))
+    else:
+        ext = ".png"
+    return name, version, comment, clean(name), exe, ext
+
+
+def desktop_file(ident, name, category, terminal, version="", comment=""):
+    """The text of the .desktop file."""
+    return (f"[Desktop Entry]\nType=Application\nName={desktop_text(name)}\n"
+            + (f"Comment={desktop_text(comment)}\n" if comment else "")
+            + f"Exec={ident}\nIcon={ident}\nCategories={category};\nTerminal={'true' if terminal else 'false'}\n"
+            + (f"X-AppImage-Version={desktop_text(version)}\n" if version else ""))
+
+
+def apprun_script(ident, exe, libs):
+    """The text of AppRun: it starts the program, with LD_LIBRARY_PATH pointing at the .so folders packed next to it."""
+    out = '#!/bin/sh\nHERE="$(dirname "$(readlink -f "$0")")"\n'
+    if libs:                                        # let the program find the .so files packed next to it
+        parts = ":".join('"$APP"' if r == "." else '"$APP"/' + shlex.quote(r) for r in libs)
+        out += (f'APP="$HERE"/{shlex.quote(f"usr/lib/{ident}")}\n'
+                f'LD_LIBRARY_PATH={parts}"${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}"; export LD_LIBRARY_PATH\n')
+    return out + f'exec "$HERE"/{shlex.quote(f"usr/lib/{ident}/{exe}")} "$@"\n'
+
+
+def preview(src, name, exe, icon, category, terminal, version="", comment=""):
+    """(clean name, .desktop text, AppRun text) exactly as a build would write them, with the same checks and without
+    copying anything."""
+    name, version, comment, ident, exe, _ext = check_inputs(src, name, exe, icon, category, version, comment)
+    libs = library_dirs(src) if os.path.isdir(os.path.realpath(src)) else []
+    return ident, desktop_file(ident, name, category, terminal, version, comment), apprun_script(ident, exe, libs)
+
+
+def make_appdir(src, name, exe, icon, category, terminal, appdir, version="", comment=""):
+    """Lay out an AppDir in appdir (must not exist). src is a file or a folder; exe is the program to start,
+    relative to the folder (ignored for a single file). Returns the clean name used for files."""
+    name, version, comment, ident, exe, ext = check_inputs(src, name, exe, icon, category, version, comment)
+    src = os.path.realpath(src)
+    lib = f"{appdir}/usr/lib/{ident}"
+    os.makedirs(lib)
+    if os.path.isdir(src):
+        shutil.copytree(src, lib, symlinks=True, dirs_exist_ok=True,
+                        ignore=lambda d, names: [n for n in names if outside_link(os.path.join(d, n), src)])
+    else: shutil.copy2(src, f"{lib}/{exe}")
+    if icon: shutil.copy2(icon, f"{appdir}/{ident}{ext}")
+    else: placeholder_icon(f"{appdir}/{ident}{ext}")
+    shutil.copy2(f"{appdir}/{ident}{ext}", f"{appdir}/.DirIcon")
+    with open(f"{appdir}/{ident}.desktop", "w") as f: f.write(desktop_file(ident, name, category, terminal, version, comment))
+    with open(f"{appdir}/AppRun", "w") as f: f.write(apprun_script(ident, exe, library_dirs(src) if os.path.isdir(src) else []))
+    os.chmod(f"{appdir}/AppRun", 0o755)
+    return ident
+
+
+RUNTIME_URL = "https://github.com/AppImage/type2-runtime/releases"
+TOOL_DL = "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-{arch}.AppImage"
+RUNTIME_DL = "https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-{arch}"
+MAX_DOWNLOAD = 200 * 1024 * 1024
+RUNTIME_DIR = os.path.expanduser("~/.local/share/satchel")
+TOOL_HOME = os.path.expanduser("~/.local/bin/appimagetool")
+
+
+def find_tool():
+    return os.environ.get("APPIMAGETOOL") or shutil.which("appimagetool") or next(
+        (p for p in (TOOL_HOME, os.path.expanduser("~/bin/appimagetool")) if os.access(p, os.X_OK)), None)
+
+
+def find_download():
+    """An appimagetool file you already downloaded into ~/Downloads (newest first), or None."""
+    d = os.path.expanduser("~/Downloads")
+    try: names = [f for f in os.listdir(d) if f.lower().startswith("appimagetool")]
+    except OSError: return None
+    files = [f"{d}/{n}" for n in names if os.path.isfile(f"{d}/{n}")]
+    files.sort(key=lambda p: (platform.machine() not in os.path.basename(p), -os.path.getmtime(p)))
+    return files[0] if files else None
+
+
+def install_tool(src, dest=TOOL_HOME):
+    """Copy a file you downloaded to ~/.local/bin/appimagetool and make it executable. Refuses anything that isn't a program."""
+    try:
+        with open(src, "rb") as f: magic = f.read(4)
+    except OSError as e: raise BuildError(f"Could not read that file: {e}")
+    if magic != b"\x7fELF": raise BuildError("That is not a program file (an AppImage starts with ELF). Did the download save a web page?")
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    tmp = dest + ".new"
+    shutil.copyfile(src, tmp); os.chmod(tmp, 0o755); os.replace(tmp, dest)
+    return dest
+
+
+def download(url, dest, opener=None):
+    """Fetch an https address into the file dest (at most MAX_DOWNLOAD bytes). Raises BuildError; leaves no partial file."""
+    import urllib.request
+    opener = opener or urllib.request.urlopen
+    if not url.startswith("https://"): raise BuildError("Only https downloads are allowed.")
+    try:
+        with opener(urllib.request.Request(url, headers={"User-Agent": "satchel"}), timeout=30) as r, open(dest, "wb") as f:
+            if not r.geturl().startswith("https://"): raise BuildError("The download was redirected to an address that is not https.")
+            total = 0
+            while True:
+                chunk = r.read(65536)
+                if not chunk: break
+                total += len(chunk)
+                if total > MAX_DOWNLOAD: raise BuildError("The download is larger than expected, so it was stopped.")
+                f.write(chunk)
+    except BuildError:
+        if os.path.exists(dest): os.unlink(dest)
+        raise
+    except OSError as e:
+        if os.path.exists(dest): os.unlink(dest)
+        raise BuildError(f"Could not download {url}\n{e}\nUse 'Use a downloaded file…' instead.")
+
+
+def download_tool(dest=None, opener=None):
+    """Download appimagetool for this machine and install it. Returns where it went."""
+    with tempfile.TemporaryDirectory(prefix="satchel-dl-") as d:
+        download(TOOL_DL.format(arch=platform.machine()), f"{d}/t", opener)
+        if appimage_offset(f"{d}/t") is None: raise BuildError("What was downloaded is not an AppImage, so it was not installed.")
+        return install_tool(f"{d}/t", *([dest] if dest else []))
+
+
+def download_runtime(dest=None, opener=None):
+    """Download the AppImage runtime for this machine and install it. Returns where it went."""
+    with tempfile.TemporaryDirectory(prefix="satchel-dl-") as d:
+        download(RUNTIME_DL.format(arch=platform.machine()), f"{d}/r", opener)
+        return install_runtime(f"{d}/r", dest)
+
+
+def runtime_problem(path):
+    """Why path can't be used as the AppImage runtime, or None. A runtime is a small type 2 ELF program; a complete
+    AppImage (appimagetool itself, say) also starts with that ELF but has a whole program attached, and using it
+    would make every AppImage you build start that program instead of yours."""
+    try:
+        with open(path, "rb") as f: h = f.read(64)
+    except OSError as e: return f"Could not read it: {e}"
+    if h[:4] != b"\x7fELF": return "It is not a program file (it should start with ELF). Did the download save a web page?"
+    if h[8:11] != b"AI\x02": return "It is not an AppImage runtime (no type 2 marker)."
+    if appimage_offset(path) is not None: return "It is a complete AppImage (such as appimagetool itself), not the small runtime file."
+    return None
+
+
+def find_runtime(root=None):
+    """The AppImage runtime file, so appimagetool does not have to download it: yours, or one shipped inside the tool."""
+    for p in (os.environ.get("APPIMAGE_RUNTIME"), f"{RUNTIME_DIR}/runtime-{platform.machine()}",
+              root and f"{root}/usr/lib/appimagekit/runtime"):
+        if p and os.path.isfile(p) and not runtime_problem(p): return p
+    return None
+
+
+def find_runtime_download():
+    """A runtime-<arch> file you already downloaded into ~/Downloads (newest first), or None."""
+    d = os.path.expanduser("~/Downloads")
+    try: names = [f for f in os.listdir(d) if f.lower().startswith("runtime") and platform.machine() in f]
+    except OSError: return None
+    files = [f"{d}/{n}" for n in names if os.path.isfile(f"{d}/{n}") and not runtime_problem(f"{d}/{n}")]
+    return max(files, key=os.path.getmtime) if files else None
+
+
+def install_runtime(src, dest=None):
+    """Copy a downloaded runtime file to ~/.local/share/satchel/ after checking it really is a runtime."""
+    dest = dest or f"{RUNTIME_DIR}/runtime-{platform.machine()}"
+    why = runtime_problem(src)
+    if why: raise BuildError(why)
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    shutil.copyfile(src, dest + ".new"); os.chmod(dest + ".new", 0o644); os.replace(dest + ".new", dest)
+    return dest
+
+
+def appimage_offset(path):
+    """Where the squashfs image starts inside a type 2 AppImage (right after its ELF section headers), or None if it isn't one."""
+    try:
+        with open(path, "rb") as f:
+            h = f.read(64)
+            if len(h) < 64 or h[:4] != b"\x7fELF" or h[8:11] != b"AI\x02": return None
+            e = "<" if h[5] == 1 else ">"
+            if h[4] == 2: shoff, = struct.unpack_from(e + "Q", h, 0x28); sz, num = struct.unpack_from(e + "HH", h, 0x3A)
+            else: shoff, = struct.unpack_from(e + "I", h, 0x20); sz, num = struct.unpack_from(e + "HH", h, 0x2E)
+            off = shoff + sz * num
+            f.seek(off)
+            return off if f.read(4) in (b"hsqs", b"sqsh") else None
+    except (OSError, struct.error):
+        return None
+
+
+CACHE = os.path.expanduser("~/.cache/satchel")
+
+
+def prepare_tool(tool):
+    """(program to run, folder it needs or None). An AppImage tool is unpacked once and run as an ordinary program: with
+    'ajail on' every AppImage is started inside a second sandbox that cannot see the build folder."""
+    real = os.path.realpath(tool)
+    off = appimage_offset(real)
+    if off is None: return real, None
+    st = os.stat(real)
+    base = f"{CACHE}/{clean(os.path.basename(real))}-{st.st_size}-{st.st_mtime_ns}"
+    root = f"{base}/root"
+    if not os.path.isfile(f"{root}/AppRun"):
+        unsq = shutil.which("unsquashfs")
+        if not unsq: raise BuildError(f"unsquashfs is needed to unpack appimagetool: {install_hint('squashfs-tools')}")
+        shutil.rmtree(base, ignore_errors=True)
+        os.makedirs(base, mode=0o700)
+        tmp = f"{base}/root.tmp"
+        try: r = subprocess.run([unsq, "-no-progress", "-no-xattrs", "-o", str(off), "-d", tmp, real], capture_output=True,
+                                text=True, errors="replace", stdin=subprocess.DEVNULL, timeout=300)
+        except (OSError, subprocess.TimeoutExpired) as e: raise BuildError(f"Could not unpack appimagetool: {e}")
+        if r.returncode != 0 or not os.path.isfile(f"{tmp}/AppRun"):
+            shutil.rmtree(base, ignore_errors=True)
+            raise BuildError("Could not unpack appimagetool:\n" + (r.stderr or r.stdout).strip()[-600:])
+        subprocess.run(["chmod", "-R", "u+rwX", tmp], check=False)
+        os.replace(tmp, root)
+    return f"{root}/AppRun", root
+
+
+def need_bwrap():
+    """The bubblewrap program, or a BuildError that says how to install it."""
+    bwrap = shutil.which("bwrap")
+    if not bwrap: raise BuildError(f"The sandbox is switched on but bubblewrap (bwrap) was not found: {install_hint('bubblewrap')}")
+    return bwrap
+
+
+def bwrap_base(bwrap, show, work, arch, home, net, version=""):
+    """The bubblewrap part of a command, ending in '--': the system is read-only, your real home and other users are
+    hidden, /tmp is fresh, and only the work folder is writable. Network only if net (it is needed to download the
+    runtime when you have not set one). Files in show that lie inside your home are shown read-only. No system-call
+    filter: this is a convenience sandbox, not a security boundary."""
+    parent = os.path.dirname(home)
+    a = [bwrap, "--unshare-all", *(["--share-net"] if net else []), "--die-with-parent", "--new-session", "--clearenv",
+         "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--tmpfs", "/run"]
+    if net: a += [x for d in ("/run/systemd/resolve", "/run/NetworkManager") for x in ("--ro-bind-try", d, d)]   # DNS
+    a += ["--tmpfs", parent] if parent != "/" else []
+    a += ["--tmpfs", home]
+    for d in ("/root", "/mnt", "/media", "/srv"):
+        if os.path.isdir(d) and not os.path.islink(d) and home != d and not home.startswith(d + "/"): a += ["--tmpfs", d]
+    for q in dict.fromkeys(os.path.realpath(x) for x in show if x):
+        if q.startswith(home + "/"): a += ["--ro-bind", q, q]
+    a += ["--bind", work, work]
+    for k, v in (("HOME", home), ("PATH", "/usr/local/bin:/usr/bin:/usr/sbin"), ("LANG", "C.UTF-8"), ("ARCH", arch),
+                 *((("VERSION", version),) if version else ())):
+        a += ["--setenv", k, v]
+    return a + ["--chdir", work, "--"]
+
+
+def bwrap_cmd(bwrap, exe, share, runtime, appdir, out, work, arch, home, net, version=""):
+    """appimagetool inside bubblewrap (see bwrap_base). A tool or runtime file inside your home is shown read-only."""
+    return (bwrap_base(bwrap, (share or exe, runtime), work, arch, home, net, version)
+            + [exe, *(["--runtime-file", runtime] if runtime else []), appdir, out])
+
+
+def run_streaming(cmd, env, cwd, log=None, cancel=None, timeout=600, timeout_is_error=True, own_group=True):
+    """Run cmd and hand each line of its output (errors included) to log as it appears. The program is stopped when
+    cancel is set (raises Cancelled), on Ctrl-C, or after timeout seconds (raises BuildError, or just returns when
+    timeout_is_error is False). With own_group it runs in a process group of its own and the whole group is stopped;
+    without it only cmd itself is stopped (bubblewrap cannot be a group leader because it starts its own session, and it
+    takes everything inside it down with it). Returns (exit code or None, the last lines of output, timed out)."""
+    if log: log("$ " + shlex.join(cmd))
+    try: p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace", env=env,
+                              cwd=cwd, stdin=subprocess.DEVNULL, start_new_session=own_group)
+    except OSError as e: raise BuildError(f"Could not start {os.path.basename(cmd[0])}: {e}")
+    tail = collections.deque(maxlen=200)
+
+    def pump():
+        for line in p.stdout:
+            line = line.rstrip("\n"); tail.append(line)
+            if log: log(line)
+    reader = threading.Thread(target=pump, daemon=True); reader.start()
+
+    def stop():
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try: os.killpg(p.pid, sig) if own_group else p.send_signal(sig)
+            except OSError: break
+            try: p.wait(timeout=3); break
+            except subprocess.TimeoutExpired: pass
+    why, deadline = None, time.monotonic() + timeout
+    try:
+        while True:
+            try: p.wait(timeout=0.1); break
+            except subprocess.TimeoutExpired: pass
+            if cancel is not None and cancel.is_set(): why = "cancel"
+            elif time.monotonic() > deadline: why = "timeout"
+            if why: stop(); break
+    except BaseException:
+        stop(); raise
+    reader.join(timeout=5)
+    if not reader.is_alive(): p.stdout.close()
+    text = "\n".join(tail)
+    if why == "cancel": raise Cancelled("Cancelled.")
+    if why == "timeout" and timeout_is_error: raise BuildError(f"It ran for more than {timeout:g} seconds, so it was stopped.")
+    return (None if why else p.returncode), text, why == "timeout"
+
+
+def build(src, name, exe, icon, category, terminal, out_dir, tool=None, sandbox=False, version="", log=None, cancel=None, comment=""):
+    """Make the AppDir in a temporary folder, run appimagetool on it (optionally inside bubblewrap), and move the
+    result to out_dir. Returns the path of the .AppImage. A version goes into the desktop file, the file name and
+    the VERSION variable that appimagetool reads; a comment goes into the desktop file. log(line) is called with the tool's output while it runs; setting
+    the cancel event stops the build (raises Cancelled)."""
+    version = version.strip()
+    tool = tool or find_tool()
+    if not tool: raise BuildError(f"appimagetool was not found. Download it from {TOOL_URL}, make it executable and put it in your PATH.")
+    if not os.path.isdir(out_dir): raise BuildError("The output folder does not exist.")
+    bwrap = need_bwrap() if sandbox else None
+    if cancel is not None and cancel.is_set(): raise Cancelled("Cancelled.")
+    prog, share = prepare_tool(tool)
+    runtime = find_runtime(share)
+    with tempfile.TemporaryDirectory(prefix="satchel-") as tmp:
+        tmp = os.path.realpath(tmp)
+        appdir = f"{tmp}/AppDir"
+        if log: log("Making the app folder…")
+        ident = make_appdir(src, name, exe, icon, category, terminal, appdir, version, comment)
+        arch = platform.machine()
+        stem = f"{ident}-{clean(version)}-{arch}" if version else f"{ident}-{arch}"
+        built = f"{tmp}/{stem}.AppImage"
+        if bwrap: cmd, env = bwrap_cmd(bwrap, prog, share, runtime, appdir, built, tmp, arch, os.path.realpath(os.path.expanduser("~")), not runtime, version), os.environ
+        else: cmd, env = [prog, *(["--runtime-file", runtime] if runtime else []), appdir, built], {**os.environ, "ARCH": arch, **({"VERSION": version} if version else {})}
+        code, text, _ = run_streaming(cmd, env, tmp, log, cancel, 600, own_group=not bwrap)
+        if code != 0 or not os.path.isfile(built):
+            hint = "\n\n(If the sandbox is the problem, switch it off and try again.)" if bwrap else ""
+            raise BuildError("appimagetool failed:\n" + text.strip()[-900:] + hint)
+        if appimage_offset(built) is None:
+            raise BuildError("appimagetool finished, but the file it made is not a valid AppImage "
+                             "(no squashfs image after the runtime), so it was not saved.\n" + text.strip()[-600:])
+        out = f"{out_dir}/{stem}.AppImage"
+        shutil.move(built, out)
+    return out
+
+
+def describe_run(code, text, timed_out, seconds, sandboxed):
+    """Plain words for how a test run went: what happened, a hint for the usual causes, then the end of its output."""
+    if timed_out: head = f"It was still running after {seconds:g} seconds, so it starts. It was stopped again."
+    elif code == 0: head = "It started and finished normally."
+    else: head = f"It stopped by itself with exit code {code}."
+    low, lines = text.lower(), [head]
+    if "shared librar" in low or "shared object file" in low:
+        lines.append("A shared library is missing. Install it, or pack it in the folder.")
+    if "exec format error" in low:
+        lines.append("The program is not for this kind of computer, or it is not a real program (exec format error).")
+    if code in (126, 127):
+        lines.append("The program could not be started at all: check that the right file is chosen and that it is executable.")
+    if sandboxed and not timed_out and code != 0 and any(w in low for w in ("display", "wayland", "xcb", "x server")):
+        lines.append("It looks like a window program. The sandbox gives it no display, so it cannot open a window here; "
+                     "switch the sandbox off to see it.")
+    if sandboxed: lines.append("(It ran inside the sandbox: no network, your home folder hidden.)")
+    tail = text.strip()[-700:]
+    return "\n".join(lines) + (f"\n\nOutput:\n{tail}" if tail else "")
+
+
+def try_run(src, name, exe, icon, category, terminal, sandbox=False, seconds=5, log=None, cancel=None):
+    """Start the packed program the way the AppImage would and watch it for a few seconds (inside bubblewrap, with no
+    network and your home hidden, when sandbox is on). Returns (ok, a description); ok means it ran fine or was still
+    running when the time was up. It catches a wrong program, a missing library or a format error before you build."""
+    bwrap = need_bwrap() if sandbox else None
+    with tempfile.TemporaryDirectory(prefix="satchel-try-") as tmp:
+        tmp = os.path.realpath(tmp)
+        appdir = f"{tmp}/AppDir"
+        make_appdir(src, name, exe, icon, category, terminal, appdir)             # the same checks as a build
+        cmd = [f"{appdir}/AppRun"]
+        if bwrap: cmd = bwrap_base(bwrap, (), tmp, platform.machine(), os.path.realpath(os.path.expanduser("~")), False) + cmd
+        code, text, timed_out = run_streaming(cmd, os.environ, tmp, log, cancel, seconds, False, own_group=not bwrap)
+    return (timed_out or code == 0), describe_run(code, text, timed_out, seconds, bool(bwrap))
+
+
+def cli(argv):
+    """Build from the command line, no window. Prints the path of the AppImage; returns the exit code."""
+    import argparse
+    p = argparse.ArgumentParser(prog="satchel", description="Build an AppImage from a program file or folder (no window).")
+    p.add_argument("source", help="the program file, or the folder that holds the program")
+    p.add_argument("--name", help="app name (default: the file or folder name)")
+    p.add_argument("--exe", default="", help="for a folder: the program to start, relative to the folder")
+    p.add_argument("--icon", help="a .png or .svg file")
+    p.add_argument("--category", default="Utility", choices=CATEGORIES)
+    p.add_argument("--version", default="", help="goes into the file name and the desktop file")
+    p.add_argument("--comment", default="", help="a short description for the desktop file")
+    p.add_argument("--terminal", action="store_true", help="the app runs in a terminal")
+    p.add_argument("--out", default=".", help="folder for the result (default: here)")
+    p.add_argument("--sandbox", action="store_true", help="run appimagetool (or the test run) inside bubblewrap")
+    p.add_argument("--try", dest="try_first", action="store_true",
+                   help="only start the program for a few seconds to see that it works; builds nothing")
+    p.add_argument("--seconds", type=float, default=5, help="with --try: how long to watch the program (default 5)")
+    p.add_argument("--dry-run", action="store_true", help="only print the .desktop file and AppRun that would be made; builds nothing")
+    p.add_argument("-v", "--verbose", action="store_true", help="show the output while it runs")
+    a = p.parse_args(argv)
+    name = a.name or default_name(os.path.realpath(a.source))
+    log = (lambda line: print(line, file=sys.stderr)) if a.verbose else None
+    note = packing_notes(a.source, a.exe)
+    try:
+        if a.dry_run:
+            ident, desktop, apprun = preview(a.source, name, a.exe, a.icon, a.category, a.terminal, a.version, a.comment)
+            print(f"--- {ident}.desktop ---\n{desktop}\n--- AppRun ---\n{apprun}", end="")
+            if note: print(note, file=sys.stderr)
+            return 0
+        if a.try_first:
+            ok, text = try_run(a.source, name, a.exe, a.icon, a.category, a.terminal, a.sandbox, a.seconds, log)
+            print(text)
+            if note: print(note, file=sys.stderr)
+            return 0 if ok else 1
+        print(build(a.source, name, a.exe, a.icon, a.category, a.terminal, os.path.abspath(a.out), None, a.sandbox, a.version, log, None, a.comment))
+    except BuildError as e:
+        print(e, file=sys.stderr)
+        return 1
+    if note: print(note, file=sys.stderr)
+    return 0
+
+
+# ---- window (GTK is loaded only here, so the functions above can be tested without it) ----
+def run_gui():
+    import gi
+    gi.require_version("Gtk", "4.0"); gi.require_version("Adw", "1")
+    from gi.repository import Adw, Gdk, Gio, GLib, Gtk
+
+    class Win(Adw.ApplicationWindow):
+        def __init__(self, app):
+            super().__init__(application=app, title="Satchel", default_width=560, default_height=760)
+            self.saved = load_settings()
+            self.src, self.icon, self.exes = None, None, []
+            self.auto_name = ""                         # the name last suggested from the program (see auto_name)
+            self.last_dir = self.saved.get("last_dir")  # where the file dialogs open next
+            self.out_dir = self.saved.get("out_dir", os.path.expanduser("~"))
+            self.cancel_ev = None                       # set while a build runs; the Build button is Cancel then
+            self.toasts = Adw.ToastOverlay()
+            bar = Adw.HeaderBar()
+            about = Gtk.Button(icon_name="help-about-symbolic", tooltip_text="About", css_classes=["flat"])
+            about.connect("clicked", lambda *_: self.about()); bar.pack_end(about)
+            view = Adw.ToolbarView(); view.add_top_bar(bar)
+            page = Adw.PreferencesPage()
+            view.set_content(page); self.toasts.set_child(view); self.set_content(self.toasts)
+
+            g = Adw.PreferencesGroup(title="appimagetool", description="The official tool that makes the AppImage. Nothing is downloaded unless you press Download (https, from the AppImage project).")
+            self.tool_row = Adw.ActionRow(title="appimagetool", use_markup=False)
+            self.use_dl = Gtk.Button(valign=Gtk.Align.CENTER, css_classes=["suggested-action"])
+            self.use_dl.connect("clicked", lambda *_: self.install(self.dl))
+            self.get_btn = Gtk.Button(label="Download", valign=Gtk.Align.CENTER)
+            self.get_btn.connect("clicked", lambda *_: self.fetch(download_tool, self.get_btn))
+            self.have_btn = Gtk.Button(label="Use a downloaded file…", valign=Gtk.Align.CENTER, css_classes=["flat"])
+            self.have_btn.connect("clicked", lambda *_: self.choose_tool())
+            for b in (self.use_dl, self.get_btn, self.have_btn): self.tool_row.add_suffix(b)
+            g.add(self.tool_row)
+            self.rt_row = Adw.ActionRow(title="Runtime", use_markup=False)
+            self.rt_use = Gtk.Button(valign=Gtk.Align.CENTER, css_classes=["suggested-action"])
+            self.rt_use.connect("clicked", lambda *_: self.install_rt(self.rt_dl))
+            self.rt_get = Gtk.Button(label="Download", valign=Gtk.Align.CENTER)
+            self.rt_get.connect("clicked", lambda *_: self.fetch(download_runtime, self.rt_get))
+            self.rt_have = Gtk.Button(label="Use a downloaded file…", valign=Gtk.Align.CENTER, css_classes=["flat"])
+            self.rt_have.connect("clicked", lambda *_: self.choose_rt())
+            for b in (self.rt_use, self.rt_get, self.rt_have): self.rt_row.add_suffix(b)
+            g.add(self.rt_row)
+            self.tool_group = g
+            self.box_row = Adw.SwitchRow(title="Run it in a bubblewrap sandbox", active=self.saved.get("sandbox", True), visible=bool(shutil.which("bwrap")),
+                                         subtitle="Hides your home folder. No network once a runtime file is set")
+            g.add(self.box_row); page.add(g)
+
+            g = Adw.PreferencesGroup(title="Program", description="What goes inside the AppImage.")
+            self.prog_row = Adw.ActionRow(title="Program", subtitle="Nothing chosen yet", use_markup=False)
+            self.pick_button(self.prog_row, "File…", lambda: self.choose(False))
+            self.pick_button(self.prog_row, "Folder…", lambda: self.choose(True))
+            self.exe_row = Adw.ComboRow(title="Starts", subtitle="The program to run inside the folder", visible=False)
+            g.add(self.prog_row); g.add(self.exe_row); page.add(g)
+
+            g = Adw.PreferencesGroup(title="App")
+            self.name_row = Adw.EntryRow(title="Name")
+            self.ver_row = Adw.EntryRow(title="Version (optional)")
+            self.comment_row = Adw.EntryRow(title="Description (optional)")
+            self.name_row.connect("changed", self.name_changed)
+            self.icon_row = Adw.ActionRow(title="Icon", subtitle="None: a plain placeholder is made", use_markup=False)
+            self.pick_button(self.icon_row, "Choose…", self.choose_icon)
+            self.cat_row = Adw.ComboRow(title="Category", model=Gtk.StringList.new(CATEGORIES))
+            if self.saved.get("category"): self.cat_row.set_selected(CATEGORIES.index(self.saved["category"]))
+            self.term_row = Adw.SwitchRow(title="Runs in a terminal", active=self.saved.get("terminal", False))
+            for r in (self.name_row, self.ver_row, self.comment_row, self.icon_row, self.cat_row, self.term_row): g.add(r)
+            page.add(g)
+
+            g = Adw.PreferencesGroup(title="Result")
+            self.out_row = Adw.ActionRow(title="Save in", subtitle=self.out_dir, use_markup=False)
+            self.pick_button(self.out_row, "Choose…", self.choose_out)
+            self.go = Gtk.Button(label="Build AppImage", css_classes=["suggested-action", "pill"])
+            self.go.connect("clicked", self.start)
+            self.try_btn = Gtk.Button(label="Try it first", css_classes=["pill"],
+                                      tooltip_text="Start the program for a few seconds to see that it works")
+            self.try_btn.connect("clicked", self.try_it)
+            self.prev_btn = Gtk.Button(label="Preview files", css_classes=["pill"],
+                                       tooltip_text="Show the desktop file and AppRun that will be made, without building")
+            self.prev_btn.connect("clicked", self.preview_it)
+            buttons = Gtk.Box(spacing=12, halign=Gtk.Align.CENTER, margin_top=12)
+            buttons.append(self.prev_btn); buttons.append(self.try_btn); buttons.append(self.go)
+            g.add(self.out_row); g.add(buttons); page.add(g)
+
+            self.log_view = Gtk.TextView(editable=False, cursor_visible=False, monospace=True, wrap_mode=Gtk.WrapMode.WORD_CHAR,
+                                         left_margin=8, right_margin=8, top_margin=6, bottom_margin=6)
+            self.log_buf = self.log_view.get_buffer()
+            self.log_end = self.log_buf.create_mark(None, self.log_buf.get_end_iter(), False)
+            self.log_group = Adw.PreferencesGroup(title="Log", visible=False)
+            self.log_group.add(Gtk.ScrolledWindow(child=self.log_view, min_content_height=180, css_classes=["card"]))
+            page.add(self.log_group)
+            self.refresh_tool()
+            drop = Gtk.DropTarget.new(Gio.File, Gdk.DragAction.COPY)       # drop a program, folder or icon on the window
+            drop.connect("drop", self.dropped); self.add_controller(drop)
+            keys = Gtk.ShortcutController()
+            keys.add_shortcut(Gtk.Shortcut.new(Gtk.ShortcutTrigger.parse_string("<Control>b"),
+                                               Gtk.CallbackAction.new(self.shortcut_build)))
+            self.add_controller(keys)
+
+        def shortcut_build(self, *_):
+            if self.go.get_sensitive(): self.start()
+            return True
+
+        def about(self):
+            kw = dict(application_name="Satchel", version=APP_VERSION, license_type=Gtk.License.GPL_3_0,
+                      comments="Pick a program, name it, pick an icon, build an AppImage. It packs exactly what you give it.",
+                      website="https://github.com/AppImage/appimagetool")
+            try: Adw.AboutDialog(**kw).present(self)
+            except AttributeError: Adw.AboutWindow(transient_for=self, **kw).present()      # older libadwaita
+
+        def name_changed(self, *_):
+            if self.name_row.get_text().strip(): self.name_row.remove_css_class("error")
+            else: self.name_row.add_css_class("error")
+
+        def remember(self, path):
+            """Open the next file dialog in the folder this path is in."""
+            d = os.path.dirname(path.rstrip("/"))
+            if d and os.path.isdir(d): self.last_dir = d
+
+        def dialog(self, title):
+            dlg = Gtk.FileDialog(title=title)
+            if self.last_dir: dlg.set_initial_folder(Gio.File.new_for_path(self.last_dir))
+            return dlg
+
+        def save(self):
+            save_settings({"out_dir": self.out_dir, "category": CATEGORIES[self.cat_row.get_selected()],
+                           "terminal": self.term_row.get_active(), "sandbox": self.box_row.get_active(),
+                           **({"last_dir": self.last_dir} if self.last_dir else {})})
+
+        def dropped(self, _target, value, _x, _y):
+            path = value.get_path() if value is not None else None
+            if not path or not os.path.exists(path): return False
+            if os.path.isfile(path) and os.path.splitext(path)[1].lower() in ICON_EXT: self.set_icon(path)
+            else: self.set_source(path)
+            return True
+
+        def set_icon(self, path):
+            why = icon_problem(path)
+            if why: return self.alert("Can't use that icon", why)
+            self.icon = path; self.icon_row.set_subtitle(path); self.remember(path)
+
+        def show_folder(self, path):
+            try:
+                def done(launcher, res):
+                    try: launcher.open_containing_folder_finish(res)
+                    except GLib.Error: pass
+                Gtk.FileLauncher.new(Gio.File.new_for_path(path)).open_containing_folder(self, None, done)
+            except AttributeError:                      # GTK older than 4.10
+                Gtk.show_uri(self, "file://" + os.path.dirname(path), Gdk.CURRENT_TIME)
+
+        def refresh_tool(self):
+            tool, self.dl = find_tool(), find_download()
+            self.tool_row.set_subtitle(tool or "Not found")
+            self.get_btn.set_visible(not tool); self.have_btn.set_visible(not tool)
+            self.use_dl.set_visible(not tool and bool(self.dl))
+            if self.dl: self.use_dl.set_label("Use " + os.path.basename(self.dl))
+            self.go.set_sensitive(bool(tool))
+            rt, self.rt_dl = find_runtime(), find_runtime_download()
+            self.rt_row.set_subtitle((rt or "Optional: if not set, appimagetool downloads it itself on every build, so the sandbox gets network (runtime-%s)" % platform.machine()))
+            for b in (self.rt_get, self.rt_have): b.set_visible(not rt)
+            self.rt_use.set_visible(not rt and bool(self.rt_dl))
+            if self.rt_dl: self.rt_use.set_label("Use " + os.path.basename(self.rt_dl))
+
+        def install_rt(self, path):
+            try: install_runtime(path)
+            except BuildError as e: return self.alert("Can't use that file", str(e))
+            self.refresh_tool(); self.toasts.add_toast(Adw.Toast(title="Runtime is ready"))
+
+        def choose_rt(self):
+            dlg = self.dialog("Choose the runtime file you downloaded")
+            def done(d, res):
+                try: f = d.open_finish(res)
+                except GLib.Error: return
+                self.install_rt(f.get_path())
+            dlg.open(self, None, done)
+
+        def install(self, path):
+            try: install_tool(path)
+            except BuildError as e: return self.alert("Can't use that file", str(e))
+            self.refresh_tool(); self.toasts.add_toast(Adw.Toast(title="appimagetool is ready"))
+
+        def choose_tool(self):
+            dlg = self.dialog("Choose the appimagetool file you downloaded")
+            def done(d, res):
+                try: f = d.open_finish(res)
+                except GLib.Error: return
+                self.install(f.get_path())
+            dlg.open(self, None, done)
+
+        def fetch(self, fn, btn):
+            """Download in the background: the file comes from the official AppImage project over https."""
+            btn.set_sensitive(False); btn.set_label("Downloading…")
+            def work():
+                try: fn(); err = None
+                except BuildError as e: err = str(e)
+                GLib.idle_add(self.fetched, btn, err)
+            threading.Thread(target=work, daemon=True).start()
+
+        def fetched(self, btn, err):
+            btn.set_sensitive(True); btn.set_label("Download")
+            self.refresh_tool()
+            if err: self.alert("Download failed", err)
+            else: self.toasts.add_toast(Adw.Toast(title="Downloaded and installed"))
+
+        def pick_button(self, row, label, cb):
+            b = Gtk.Button(label=label, valign=Gtk.Align.CENTER, css_classes=["flat"])
+            b.connect("clicked", lambda *_: cb()); row.add_suffix(b)
+
+        def alert(self, heading, body, extra=None):
+            """A message you can select with the mouse, with a Copy button (long errors scroll). extra is an optional
+            (label, function) pair for one more button."""
+            d = Adw.AlertDialog(heading=heading)
+            lab = Gtk.Label(label=body, wrap=True, selectable=True, xalign=0, css_classes=["monospace"])
+            d.set_extra_child(Gtk.ScrolledWindow(child=lab, propagate_natural_height=True, max_content_height=320, min_content_width=360))
+            d.add_response("copy", "Copy")
+            if extra: d.add_response("extra", extra[0])
+            d.add_response("ok", "OK")
+            d.set_default_response("ok"); d.set_close_response("ok")
+            def answered(_d, r):
+                if r == "copy": self.get_clipboard().set(body)
+                elif r == "extra": extra[1]()
+            d.connect("response", answered)
+            d.present(self)
+
+        def choose(self, folder):
+            dlg = self.dialog("Choose the program folder" if folder else "Choose the program file")
+            def done(d, res):
+                try: f = d.select_folder_finish(res) if folder else d.open_finish(res)
+                except GLib.Error: return
+                self.set_source(f.get_path())
+            (dlg.select_folder if folder else dlg.open)(self, None, done)
+
+        def set_source(self, path):
+            self.src = path
+            self.prog_row.set_subtitle(path)
+            is_dir = os.path.isdir(path)
+            self.exes = find_executables(path) if is_dir else []
+            self.exe_row.set_visible(is_dir)
+            self.exe_row.set_model(Gtk.StringList.new(self.exes))
+            if is_dir and not self.exes: self.alert("No program found", "That folder has no executable file in it (two levels deep).")
+            new = default_name(path)
+            self.name_row.set_text(auto_name(self.name_row.get_text(), self.auto_name, new)); self.auto_name = new
+            self.remember(path)
+
+        def choose_icon(self):
+            dlg = self.dialog("Choose an icon (.png or .svg)")
+            def done(d, res):
+                try: f = d.open_finish(res)
+                except GLib.Error: return
+                self.set_icon(f.get_path())
+            dlg.open(self, None, done)
+
+        def choose_out(self):
+            dlg = self.dialog("Where to save the AppImage")
+            def done(d, res):
+                try: f = d.select_folder_finish(res)
+                except GLib.Error: return
+                self.out_dir = f.get_path(); self.out_row.set_subtitle(self.out_dir)
+            dlg.select_folder(self, None, done)
+
+        def log_line(self, line):
+            GLib.idle_add(self.append_log, line)        # called from the worker thread
+
+        def append_log(self, line):
+            self.log_buf.insert(self.log_buf.get_end_iter(), line + "\n")
+            self.log_view.scroll_to_mark(self.log_end, 0.0, False, 0.0, 0.0)
+
+        def show_log(self):
+            self.log_buf.set_text(""); self.log_group.set_visible(True)
+
+        def start(self, *_):
+            if self.cancel_ev:                          # a build is running: this button is Cancel now
+                self.cancel_ev.set(); self.go.set_sensitive(False); self.go.set_label("Cancelling…")
+                return
+            if not self.src: return self.alert("Nothing to pack", "Choose a program file or folder first.")
+            exe = self.exes[self.exe_row.get_selected()] if self.exes else ""
+            sandbox = self.box_row.get_active() and self.box_row.get_visible()
+            self.cancel_ev = cancel = threading.Event()
+            args = (self.src, self.name_row.get_text(), exe, self.icon, CATEGORIES[self.cat_row.get_selected()],
+                    self.term_row.get_active(), self.out_dir, None, sandbox, self.ver_row.get_text(), self.log_line, cancel,
+                    self.comment_row.get_text())
+            self.save()
+            self.show_log(); self.try_btn.set_sensitive(False); self.prev_btn.set_sensitive(False); self.tool_group.set_sensitive(False)
+            self.go.set_label("Cancel"); self.go.remove_css_class("suggested-action"); self.go.add_css_class("destructive-action")
+            def work():
+                note = packing_notes(self.src, exe)
+                try: res = (build(*args), None, False)
+                except Cancelled: res = (None, None, True)
+                except BuildError as e: res = (None, str(e), False)
+                GLib.idle_add(self.finished, *res, note)
+            threading.Thread(target=work, daemon=True).start()
+
+        def finished(self, out, err, cancelled, note=""):
+            self.cancel_ev = None
+            self.go.set_label("Build AppImage"); self.go.remove_css_class("destructive-action"); self.go.add_css_class("suggested-action")
+            self.try_btn.set_sensitive(True); self.prev_btn.set_sensitive(True); self.tool_group.set_sensitive(True); self.refresh_tool()
+            if cancelled: self.toasts.add_toast(Adw.Toast(title="Build cancelled"))
+            elif err: self.alert("Could not build it", err)
+            else: self.alert("Done", out + (f"\n\n{note}" if note else ""), ("Show in folder", lambda: self.show_folder(out)))
+
+        def try_it(self, *_):
+            if not self.src: return self.alert("Nothing to try", "Choose a program file or folder first.")
+            exe = self.exes[self.exe_row.get_selected()] if self.exes else ""
+            sandbox = self.box_row.get_active() and self.box_row.get_visible()
+            args = (self.src, self.name_row.get_text(), exe, self.icon, CATEGORIES[self.cat_row.get_selected()],
+                    self.term_row.get_active(), sandbox, 5, self.log_line)
+            self.save()
+            self.show_log(); self.try_btn.set_sensitive(False); self.go.set_sensitive(False); self.prev_btn.set_sensitive(False)
+            self.tool_group.set_sensitive(False); self.try_btn.set_label("Trying…")
+            def work():
+                try: res = (try_run(*args), None)
+                except BuildError as e: res = (None, str(e))
+                GLib.idle_add(self.tried, *res)
+            threading.Thread(target=work, daemon=True).start()
+
+        def preview_it(self, *_):
+            if not self.src: return self.alert("Nothing to preview", "Choose a program file or folder first.")
+            exe = self.exes[self.exe_row.get_selected()] if self.exes else ""
+            try: ident, desktop, apprun = preview(self.src, self.name_row.get_text(), exe, self.icon, CATEGORIES[self.cat_row.get_selected()],
+                                                  self.term_row.get_active(), self.ver_row.get_text(), self.comment_row.get_text())
+            except BuildError as e: return self.alert("Can't preview it", str(e))
+            self.alert("Files that will be made", f"{ident}.desktop\n{desktop}\nAppRun\n{apprun}")
+
+        def tried(self, result, err):
+            self.try_btn.set_sensitive(True); self.try_btn.set_label("Try it first"); self.prev_btn.set_sensitive(True)
+            self.tool_group.set_sensitive(True); self.refresh_tool()
+            if err: self.alert("Could not try it", err)
+            else: self.alert("It works" if result[0] else "It did not start", result[1])
+
+    class App(Adw.Application):
+        def __init__(self): super().__init__(application_id="io.github..Satchel")
+        def do_activate(self): (self.props.active_window or Win(self)).present()
+
+    return App().run(sys.argv[:1])
+
+
+def main(argv):
+    if not argv: return run_gui()
+    try: return cli(argv)
+    except KeyboardInterrupt:
+        print("Stopped.", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
