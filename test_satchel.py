@@ -1,8 +1,7 @@
 #!/usr/bin/python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-# Copyright (C) 2026 Your Name
 # Tests for satchel's build logic (no GTK and no real appimagetool needed):   python3 test_satchel.py
-import contextlib, io, os, stat, struct, subprocess, tarfile, tempfile, threading, time, unittest
+import contextlib, io, os, shutil, stat, struct, subprocess, tarfile, tempfile, threading, time, unittest, zipfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -715,6 +714,52 @@ class Logic(unittest.TestCase):
         self.assertEqual(cmd[0], "/usr/bin/bwrap"); self.assertNotIn("--share-net", cmd); self.assertIn("--unshare-all", cmd)
         self.assertIn("APPIMAGE_EXTRACT_AND_RUN", cmd); self.assertEqual(cmd[cmd.index("--") + 1:][0], os.path.realpath(tool))
         self.assertIn(f"{self.t}/work", cmd)                                               # the folder holding the AppDir is writable
+
+    def make_tar(self, path, files, mode="w:xz"):
+        with tarfile.open(path, mode) as tf:
+            for name, val in files.items():
+                ti = tarfile.TarInfo(name); data = val[1] if isinstance(val, tuple) else val
+                ti.size, ti.mode = len(data), 0o755 if isinstance(val, tuple) else 0o644
+                tf.addfile(ti, io.BytesIO(data))
+        return path
+
+    def test_archives_unpack_to_the_folder_inside_and_the_program_is_found(self):
+        M["placeholder_icon"](f"{self.t}/ic.png"); ic = get(f"{self.t}/ic.png", "rb")
+        files = {"firefox/firefox": ("exe", b"#!/bin/sh\necho hi\n"), "firefox/browser/chrome/icons/default/default128.png": ic,
+                 "firefox/browser/chrome/icons/default/default16.png": b"x"}
+        for ext, mode in ((".tar.xz", "w:xz"), (".tar.gz", "w:gz"), (".tar.bz2", "w:bz2")):
+            arc = self.make_tar(f"{self.t}/firefox-159.0.1{ext}", files, mode)
+            root = M["unpack_package"](arc, f"{self.t}/r{ext}")
+            self.assertEqual(root, f"{self.t}/r{ext}/firefox")                          # the single top folder is used
+            info = M["package_info"](root, M["package_hint"](arc))
+            self.assertEqual(info["exe"], "firefox"); self.assertTrue(info["icon"].endswith("default128.png"))
+        zp = f"{self.t}/tool-1.0.zip"
+        with zipfile.ZipFile(zp, "w") as zf:
+            zi = zipfile.ZipInfo("tool/run"); zi.external_attr = 0o755 << 16; zf.writestr(zi, "#!/bin/sh\necho z\n")
+            zf.writestr("../../escaped.txt", "x"); zf.writestr("tool/data.txt", "d")
+        root = M["unpack_package"](zp, f"{self.t}/z")
+        self.assertEqual(root, f"{self.t}/z/tool"); self.assertTrue(os.access(f"{root}/run", os.X_OK))
+        self.assertFalse(os.path.exists(f"{self.t}/escaped.txt")); self.assertFalse(os.path.exists(f"{self.t}/z/escaped.txt"))
+        arch = self.make_tar(f"{self.t}/foo-1.2-1-x86_64.pkg.tar.xz", {"usr/bin/foo": ("exe", b"#!/bin/sh\n"), ".PKGINFO": b"pkgname = foo\n"})
+        self.assertEqual(M["unpack_package"](arch, f"{self.t}/arch"), f"{self.t}/arch")  # an Arch package keeps its usr/ tree
+        self.assertEqual(M["package_info"](f"{self.t}/arch", "foo")["exe"], "usr/bin/foo")
+        if shutil.which("zstd"):
+            z = f"{self.t}/zz-1.0.tar.zst"; subprocess.run(["zstd", "-q", "-o", z, self.make_tar(f"{self.t}/zz.tar", {"zz/run": ("exe", b"#!/bin/sh\n")}, "w")], check=True)
+            self.assertEqual(M["unpack_package"](z, f"{self.t}/zr"), f"{self.t}/zr/zz")
+
+    def test_package_hint_and_is_package(self):
+        h = M["package_hint"]
+        self.assertEqual(h("/x/firefox_159.0.1_amd64.deb"), "firefox"); self.assertEqual(h("/x/firefox-159.0.1.tar.xz"), "firefox")
+        self.assertEqual(h("foo-1.2-1-x86_64.pkg.tar.zst"), "foo"); self.assertEqual(h("my-app-v2.0.zip"), "my-app")
+        self.assertEqual(h("plain.tgz"), "plain")
+        for n, want in (("a.zip", True), ("a.tar.gz", True), ("a.deb", True), ("a.txt", False), ("a", False)):
+            put(f"{self.t}/{n}", "x"); self.assertEqual(M["is_package"](f"{self.t}/{n}"), want)
+
+    def test_cli_takes_an_archive(self):
+        arc = self.make_tar(f"{self.t}/myapp-2.0.tar.gz", {"myapp/bin/myapp": ("exe", b"#!/bin/sh\n")}, "w:gz")
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err): self.assertEqual(M["cli"]([arc, "--dry-run"]), 0)
+        self.assertIn("Name=myapp", out.getvalue()); self.assertIn("bin/myapp", out.getvalue())
 
     def test_describe_run_explains_the_usual_causes(self):
         d = M["describe_run"]

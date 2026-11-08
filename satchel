@@ -1,13 +1,12 @@
 #!/usr/bin/python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-# Copyright (C) 2026 Your Name
 # satchel - GTK4 + libadwaita front end for appimagetool: pick a program, name it, pick an icon, build an .AppImage.
 # It packs exactly what you give it. It does NOT copy in shared libraries, so the result runs where those libraries exist.
 # Needs the appimagetool program: put it in your PATH (see README).
 # Usage: satchel                      (opens the window)
 #        satchel PROGRAM [--name N] [--exe E] [--icon I] [--category C] [--version V] [--comment T] [--terminal]
 #                             [--out DIR] [--sandbox] [--try [--seconds S]] [--dry-run] [-v]
-import collections, glob, hashlib, json, os, platform, re, shlex, shutil, signal, struct, subprocess, sys, tarfile, tempfile, threading, time, unicodedata, zlib
+import collections, glob, hashlib, json, os, platform, re, shlex, shutil, signal, stat, struct, subprocess, sys, tarfile, tempfile, threading, time, unicodedata, zipfile, zlib
 
 CATEGORIES = ["Utility", "Development", "Graphics", "Network", "AudioVideo", "Office", "Game", "Education",
               "Science", "System", "Settings"]
@@ -398,7 +397,8 @@ def missing_note(missing):
 
 
 # ---- packages (.deb): unpacked into a folder, then handled like any program folder ----
-PKG_EXT = (".deb",)
+ARCHIVE_EXT = (".tar.gz", ".tgz", ".tar.xz", ".txz", ".tar.bz2", ".tbz2", ".tar.zst", ".tzst", ".zip")
+PKG_EXT = (".deb",) + ARCHIVE_EXT                  # a .pkg.tar.zst (Arch) is an archive that also holds a usr/ tree
 MAX_UNPACKED = 8 << 30
 CATEGORY_MAP = {"Utility": "Utility", "TextEditor": "Utility", "Development": "Development", "IDE": "Development",
                 "Graphics": "Graphics", "Network": "Network", "WebBrowser": "Network", "Email": "Network",
@@ -408,12 +408,18 @@ CATEGORY_MAP = {"Utility": "Utility", "TextEditor": "Utility", "Development": "D
 
 
 def is_package(path):
+    """A .deb, an Arch package, a .tar.* archive or a .zip: something Satchel unpacks to find the program inside."""
     return os.path.isfile(path) and path.lower().endswith(PKG_EXT)
 
 
 def package_hint(path):
-    """The package name from a file name like firefox_159.0.1_amd64.deb."""
-    return os.path.splitext(os.path.basename(path))[0].split("_")[0]
+    """The program name from a file name like firefox_159.0.1_amd64.deb, firefox-159.0.1.tar.xz or foo-1.2-1-x86_64.pkg.tar.zst."""
+    n = os.path.basename(path)
+    for ext in sorted(PKG_EXT, key=len, reverse=True):
+        if n.lower().endswith(ext): n = n[:-len(ext)]; break
+    n = re.sub(r"\.pkg$", "", n)
+    n = n.split("_")[0]
+    return re.sub(r"[-.]v?\d[\w.+~:-]*$", "", n) or n
 
 
 def ar_members(f):
@@ -430,12 +436,8 @@ def ar_members(f):
         f.seek(start + size + (size & 1))
 
 
-def _tar_ready(raw, name, work):
-    """A tar file tarfile can open: gz, bz2 and xz are read directly, zstd is unpacked first."""
-    kind = name[len("data.tar"):]
-    if kind in ("", ".gz", ".bz2", ".xz"): return raw
-    if kind != ".zst": raise BuildError(f"This package uses a compression Satchel does not know ({name}).")
-    out = f"{work}/data.tar"
+def zstd_unpack(raw, out):
+    """Decompress the zstd file raw into out (Python 3.14's own module, else the zstd program)."""
     try:
         from compression import zstd                                    # Python 3.14 and later
         with zstd.open(raw, "rb") as s_, open(out, "wb") as o: shutil.copyfileobj(s_, o)
@@ -447,6 +449,14 @@ def _tar_ready(raw, name, work):
                        stdin=subprocess.DEVNULL, timeout=600)
     if r.returncode != 0: raise BuildError("Could not unpack the package:\n" + (r.stderr or r.stdout).strip()[-400:])
     return out
+
+
+def _tar_ready(raw, name, work):
+    """A tar file tarfile can open: gz, bz2 and xz are read directly, zstd is unpacked first."""
+    kind = name[len("data.tar"):]
+    if kind in ("", ".gz", ".bz2", ".xz"): return raw
+    if kind != ".zst": raise BuildError(f"This package uses a compression Satchel does not know ({name}).")
+    return zstd_unpack(raw, f"{work}/data.tar")
 
 
 def extract_tar(tar_path, dest):
@@ -510,9 +520,73 @@ def unpack_deb(path, dest):
     except OSError as e: raise BuildError(f"Could not read the package: {e}")
 
 
+def extract_zip(zip_path, dest):
+    """Unpack a .zip into dest with the same safety rules as extract_tar (nothing outside dest, links kept only when
+    they stay inside, size limited). The program's executable bit is kept."""
+    base, total = os.path.realpath(dest), 0
+    inside = lambda p: p == base or p.startswith(base + os.sep)
+    os.makedirs(base, exist_ok=True)
+    try:
+        with zipfile.ZipFile(zip_path) as zf:
+            for zi in zf.infolist():
+                parts = [x for x in zi.filename.replace("\\", "/").split("/") if x not in ("", ".")]
+                if not parts or ".." in parts: continue
+                target = os.path.join(base, *parts); parent = os.path.dirname(target)
+                if not inside(os.path.realpath(parent)): continue
+                mode = (zi.external_attr >> 16) & 0o7777
+                if zi.is_dir():
+                    if not os.path.islink(target): os.makedirs(target, exist_ok=True); os.chmod(target, (mode & 0o777) | 0o700)
+                    continue
+                os.makedirs(parent, exist_ok=True)
+                if stat.S_ISLNK(mode):
+                    link = zf.read(zi).decode("utf-8", "replace")
+                    if os.path.isabs(link): link = os.path.relpath(os.path.join(base, link.lstrip("/")), parent)
+                    if not inside(os.path.normpath(os.path.join(parent, link))): continue
+                    if os.path.lexists(target): os.remove(target)
+                    os.symlink(link, target)
+                    continue
+                if os.path.lexists(target): os.remove(target)
+                with zf.open(zi) as src_, open(target, "wb") as out:
+                    while True:
+                        chunk = src_.read(1 << 20)
+                        if not chunk: break
+                        total += len(chunk)
+                        if total > MAX_UNPACKED: raise BuildError("The archive is unpacked larger than 8 GB, so it was not unpacked.")
+                        out.write(chunk)
+                os.chmod(target, ((mode & 0o777) or 0o644) | 0o600)
+    except BuildError: raise
+    except Exception as e: raise BuildError(f"Could not unpack the archive: {e}")
+
+
+def single_folder(dest):
+    """dest, or the one folder inside it when that is all it holds (firefox.tar.xz holds just firefox/)."""
+    try: names = os.listdir(dest)
+    except OSError: return dest
+    if len(names) == 1:
+        inner = os.path.join(dest, names[0])
+        if os.path.isdir(inner) and not os.path.islink(inner): return inner
+    return dest
+
+
+def unpack_archive(path, dest):
+    """Unpack a .zip or .tar.* into dest."""
+    if path.lower().endswith(".zip"): return extract_zip(path, dest)
+    with tempfile.TemporaryDirectory(prefix="satchel-tar-", dir=os.path.dirname(os.path.abspath(dest))) as work:
+        raw = path
+        if path.lower().endswith((".zst", ".tzst")): raw = zstd_unpack(path, f"{work}/archive.tar")
+        extract_tar(raw, dest)
+
+
 def unpack_package(path, dest):
-    if path.lower().endswith(".deb"): return unpack_deb(path, dest)
-    raise BuildError("Only .deb packages can be opened so far.")
+    """Unpack a .deb, an Arch package, a .tar.* archive or a .zip into dest. Returns the folder to use as the program
+    folder: dest itself, except that an ordinary archive holding a single folder gives that folder."""
+    low = path.lower()
+    if low.endswith(".deb"):
+        unpack_deb(path, dest); return dest
+    if not low.endswith(ARCHIVE_EXT): raise BuildError("Only .deb packages, .tar.* archives and .zip files can be opened.")
+    try: unpack_archive(path, dest)
+    except OSError as e: raise BuildError(f"Could not read the archive: {e}")
+    return dest if ".pkg." in os.path.basename(low) else single_folder(dest)
 
 
 def parse_desktop(path):
@@ -1069,19 +1143,19 @@ def cli(argv):
         return cli_run(a)
     with tempfile.TemporaryDirectory(prefix="satchel-pkg-") as t:
         root = f"{t}/root"
-        try: unpack_package(a.source, root)
+        try: root = unpack_package(a.source, root)
         except BuildError as e:
             print(e, file=sys.stderr)
             return 1
         hint = package_hint(a.source)
         info = package_info(root, hint)
         if not (a.exe or info["exe"]):
-            print("No program was found inside that package.", file=sys.stderr)
+            print("No program was found inside that file.", file=sys.stderr)
             return 1
         a.name, a.exe = a.name or info["name"] or hint, a.exe or info["exe"]
         a.icon, a.comment = a.icon or info["icon"], a.comment or info["comment"]
         a.category, a.terminal = a.category or info["category"] or "Utility", a.terminal or info["terminal"]
-        print(f"From the package: program {a.exe}, name {a.name}" + (f", icon {os.path.relpath(a.icon, root)}" if a.icon else ""),
+        print(f"From the package or archive: program {a.exe}, name {a.name}" + (f", icon {os.path.relpath(a.icon, root)}" if a.icon else ""),
               file=sys.stderr)
         a.source = root
         return cli_run(a)
@@ -1399,26 +1473,26 @@ def run_gui():
             def work():
                 tmp = tempfile.mkdtemp(prefix="satchel-pkg-")
                 try:
-                    root = f"{tmp}/root"; unpack_package(path, root)
-                    res = (tmp, package_info(root, package_hint(path)), None)
+                    root = unpack_package(path, f"{tmp}/root")
+                    res = (tmp, root, package_info(root, package_hint(path)), None)
                 except BuildError as e:
-                    shutil.rmtree(tmp, ignore_errors=True); res = (None, None, str(e))
+                    shutil.rmtree(tmp, ignore_errors=True); res = (None, None, None, str(e))
                 GLib.idle_add(self.package_ready, path, *res)
             threading.Thread(target=work, daemon=True).start()
 
-        def package_ready(self, path, tmp, info, err):
+        def package_ready(self, path, tmp, root, info, err):
             self.pkg_busy = False
             for b in (self.go, self.try_btn, self.prev_btn): b.set_sensitive(True)
             if err:
                 self.prog_row.set_subtitle(self.src or "Nothing chosen yet")
                 return self.alert("Can't open the package", err)
             self.drop_package(); self.pkg_tmp = tmp
-            self.src = f"{tmp}/root"
+            self.src = root
             self.prog_row.set_subtitle(f"{os.path.basename(path)} (unpacked)")
             self.exes = info["exes"]
             self.exe_row.set_visible(True); self.exe_row.set_model(Gtk.StringList.new(self.exes))
             if info["exe"] in self.exes: self.exe_row.set_selected(self.exes.index(info["exe"]))
-            else: self.alert("No program found", "That package has no program in usr/bin, usr/games or opt.")
+            else: self.alert("No program found", "There is no program in that file (looked in usr/bin, usr/games, opt and the top folders).")
             new = info["name"] or package_hint(path)
             self.name_row.set_text(auto_name(self.name_row.get_text(), self.auto_name, new)); self.auto_name = new
             if info["comment"] and not self.comment_row.get_text(): self.comment_row.set_text(info["comment"])
