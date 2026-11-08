@@ -574,11 +574,36 @@ def need_bwrap():
     return bwrap
 
 
-def bwrap_base(bwrap, show, work, arch, home, net, version=""):
+def display_args(env):
+    """(bubblewrap arguments, environment pairs) that let a program in the sandbox use your screen: the Wayland socket
+    and/or the X11 socket with its login file, plus /dev/dri for graphics. Nothing else of your session is shown, and
+    the network stays off. With no screen in env this adds nothing."""
+    a, e = [], []
+    run = env.get("XDG_RUNTIME_DIR", "")
+    wl = env.get("WAYLAND_DISPLAY", "")
+    if run and wl:
+        sock = wl if os.path.isabs(wl) else os.path.join(run, wl)
+        if os.path.exists(sock):
+            a += ["--ro-bind", sock, f"/run/satchel-display/{os.path.basename(sock)}"]
+            e += [("XDG_RUNTIME_DIR", "/run/satchel-display"), ("WAYLAND_DISPLAY", os.path.basename(sock))]
+    disp = env.get("DISPLAY", "")
+    if disp and os.path.isdir("/tmp/.X11-unix"):
+        a += ["--ro-bind", "/tmp/.X11-unix", "/tmp/.X11-unix"]
+        e.append(("DISPLAY", disp))
+        xa = env.get("XAUTHORITY") or os.path.expanduser("~/.Xauthority")
+        if os.path.isfile(xa):
+            a += ["--ro-bind", os.path.realpath(xa), "/run/satchel-display/Xauthority"]
+            e.append(("XAUTHORITY", "/run/satchel-display/Xauthority"))
+    if e: a += ["--dev-bind-try", "/dev/dri", "/dev/dri"]
+    return a, e
+
+
+def bwrap_base(bwrap, show, work, arch, home, net, version="", display=False):
     """The bubblewrap part of a command, ending in '--': the system is read-only, your real home and other users are
     hidden, /tmp is fresh, and only the work folder is writable. Network only if net (it is needed to download the
     runtime when you have not set one). Files in show that lie inside your home are shown read-only. No system-call
-    filter: this is a convenience sandbox, not a security boundary."""
+    filter: this is a convenience sandbox, not a security boundary. With display, the screen is let through (see
+    display_args) so a window program can open its window; the network stays off."""
     parent = os.path.dirname(home)
     a = [bwrap, "--unshare-all", *(["--share-net"] if net else []), "--die-with-parent", "--new-session", "--clearenv",
          "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--tmpfs", "/run"]
@@ -590,7 +615,11 @@ def bwrap_base(bwrap, show, work, arch, home, net, version=""):
     for q in dict.fromkeys(os.path.realpath(x) for x in show if x):
         if q.startswith(home + "/"): a += ["--ro-bind", q, q]
     a += ["--bind", work, work]
-    for k, v in (("HOME", home), ("PATH", "/usr/local/bin:/usr/bin:/usr/sbin"), ("LANG", "C.UTF-8"), ("ARCH", arch),
+    envs = []
+    if display:
+        more, envs = display_args(os.environ)
+        a += more
+    for k, v in (*envs, ("HOME", home), ("PATH", "/usr/local/bin:/usr/bin:/usr/sbin"), ("LANG", "C.UTF-8"), ("ARCH", arch),
                  *((("VERSION", version),) if version else ())):
         a += ["--setenv", k, v]
     return a + ["--chdir", work, "--"]
@@ -692,8 +721,8 @@ def describe_run(code, text, timed_out, seconds, sandboxed):
     if code in (126, 127):
         lines.append("The program could not be started at all: check that the right file is chosen and that it is executable.")
     if sandboxed and not timed_out and code != 0 and any(w in low for w in ("display", "wayland", "xcb", "x server")):
-        lines.append("It looks like a window program. The sandbox gives it no display, so it cannot open a window here; "
-                     "switch the sandbox off to see it.")
+        lines.append("It looks like a window program, but it could not reach a screen from inside the sandbox "
+                     "(the screen is shared when one is found). Switch the sandbox off to see it.")
     if sandboxed: lines.append("(It ran inside the sandbox: no network, your home folder hidden.)")
     tail = text.strip()[-700:]
     return "\n".join(lines) + (f"\n\nOutput:\n{tail}" if tail else "")
@@ -701,7 +730,7 @@ def describe_run(code, text, timed_out, seconds, sandboxed):
 
 def try_run(src, name, exe, icon, category, terminal, sandbox=False, seconds=5, log=None, cancel=None):
     """Start the packed program the way the AppImage would and watch it for a few seconds (inside bubblewrap, with no
-    network and your home hidden, when sandbox is on). Returns (ok, a description); ok means it ran fine or was still
+    network and your home hidden but your screen shared, when sandbox is on). Returns (ok, a description); ok means it ran fine or was still
     running when the time was up. It catches a wrong program, a missing library or a format error before you build."""
     bwrap = need_bwrap() if sandbox else None
     with tempfile.TemporaryDirectory(prefix="satchel-try-") as tmp:
@@ -709,7 +738,7 @@ def try_run(src, name, exe, icon, category, terminal, sandbox=False, seconds=5, 
         appdir = f"{tmp}/AppDir"
         make_appdir(src, name, exe, icon, category, terminal, appdir)             # the same checks as a build
         cmd = [f"{appdir}/AppRun"]
-        if bwrap: cmd = bwrap_base(bwrap, (), tmp, platform.machine(), os.path.realpath(os.path.expanduser("~")), False) + cmd
+        if bwrap: cmd = bwrap_base(bwrap, (), tmp, platform.machine(), os.path.realpath(os.path.expanduser("~")), False, display=True) + cmd
         code, text, timed_out = run_streaming(cmd, os.environ, tmp, log, cancel, seconds, False, own_group=not bwrap)
     return (timed_out or code == 0), describe_run(code, text, timed_out, seconds, bool(bwrap))
 
@@ -779,7 +808,7 @@ def run_gui():
             page = Adw.PreferencesPage()
             view.set_content(page); self.toasts.set_child(view); self.set_content(self.toasts)
 
-            g = Adw.PreferencesGroup(title="appimagetool", description="The official tool that makes the AppImage. Nothing is downloaded unless you press Download (https, from the AppImage project).")
+            g = Adw.PreferencesGroup(title="appimagetool", description="The tool that makes the AppImage. Nothing is downloaded unless you press Download (https, from the AppImage project's GitHub releases).")
             self.tool_row = Adw.ActionRow(title="appimagetool", use_markup=False)
             self.use_dl = Gtk.Button(valign=Gtk.Align.CENTER, css_classes=["suggested-action"])
             self.use_dl.connect("clicked", lambda *_: self.install(self.dl))
@@ -859,8 +888,7 @@ def run_gui():
 
         def about(self):
             kw = dict(application_name="Satchel", version=APP_VERSION, license_type=Gtk.License.GPL_3_0,
-                      comments="Pick a program, name it, pick an icon, build an AppImage. It packs exactly what you give it.",
-                      website="https://github.com/AppImage/appimagetool")
+                      comments="Pick a program, name it, pick an icon, build an AppImage. It packs exactly what you give it.")
             try: Adw.AboutDialog(**kw).present(self)
             except AttributeError: Adw.AboutWindow(transient_for=self, **kw).present()      # older libadwaita
 
@@ -944,7 +972,7 @@ def run_gui():
             dlg.open(self, None, done)
 
         def fetch(self, fn, btn):
-            """Download in the background: the file comes from the official AppImage project over https."""
+            """Download in the background: the file comes from the AppImage project's GitHub releases over https."""
             btn.set_sensitive(False); btn.set_label("Downloading…")
             def work():
                 try: fn(); err = None

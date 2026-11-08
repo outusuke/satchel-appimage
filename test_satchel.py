@@ -564,12 +564,22 @@ class Logic(unittest.TestCase):
             with self.assertRaisesRegex(BuildError, "bubblewrap"): M["try_run"](prog, "x", "bin/run", None, "Utility", False, True)
         finally: os.environ["PATH"] = old
 
+    def test_display_args_share_only_the_screen(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            sock = os.path.join(d, "wayland-0"); open(sock, "w").close()
+            a, e = M["display_args"]({"XDG_RUNTIME_DIR": d, "WAYLAND_DISPLAY": "wayland-0"})
+            self.assertIn(("WAYLAND_DISPLAY", "wayland-0"), e)
+            self.assertIn(sock, a)
+            self.assertNotIn("--share-net", a)
+        self.assertEqual(M["display_args"]({}), ([], []))                    # no screen: nothing is added
+
     def test_describe_run_explains_the_usual_causes(self):
         d = M["describe_run"]
         self.assertIn("exec format error", d(126, "bash: x: cannot execute: Exec format error", False, 5, False).lower())
         self.assertIn("could not be started", d(127, "", False, 5, False))
-        self.assertIn("no display", d(1, "Gtk-WARNING: cannot open display:", False, 5, True))
-        self.assertNotIn("no display", d(1, "cannot open display:", False, 5, False))                # only when sandboxed
+        self.assertIn("window program", d(1, "Gtk-WARNING: cannot open display:", False, 5, True))
+        self.assertNotIn("window program", d(1, "cannot open display:", False, 5, False))                # only when sandboxed
         self.assertIn("Output:", d(1, "boom", False, 5, False)); self.assertNotIn("Output:", d(0, "", False, 5, False))
 
     def test_command_line_try_option(self):
