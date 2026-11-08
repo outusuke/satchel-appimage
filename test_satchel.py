@@ -172,6 +172,26 @@ class Logic(unittest.TestCase):
         plain = f"{self.t}/plain"; put(plain, "x")                                  # not executable
         with self.assertRaises(BuildError): M["make_appdir"](plain, "x", "", None, "Utility", False, ad)
 
+    def test_exe_must_not_be_a_link_that_leaves_the_folder(self):
+        d, ad = self.linked_folder(), f"{self.t}/AD"
+        for exe in ("lnk", "host", "bin/up"):
+            with self.assertRaisesRegex(BuildError, "symbolic link|not an executable", msg=exe):
+                M["make_appdir"](d, "x", exe, None, "Utility", False, ad)
+        with self.assertRaisesRegex(BuildError, "symbolic link"): M["preview"](d, "x", "lnk", None, "Utility", False)
+        os.makedirs(f"{self.t}/elsewhere"); script(f"{self.t}/elsewhere/run", "")
+        os.symlink(f"../elsewhere", f"{d}/dirlink")                                  # a folder link leading out
+        with self.assertRaisesRegex(BuildError, "symbolic link"): M["preview"](d, "x", "dirlink/run", None, "Utility", False)
+        os.symlink("bin/run", f"{d}/inner_run")                                      # a link that stays inside is fine
+        M["make_appdir"](d, "x", "inner_run", None, "Utility", False, ad)
+        self.assertTrue(os.path.islink(f"{ad}/usr/lib/x/inner_run"))
+
+    def test_exe_names_that_merely_start_with_dots_are_allowed(self):
+        d = self.prog_folder(); script(f"{d}/..odd", "echo odd\n"); ad = f"{self.t}/AD"
+        M["make_appdir"](d, "x", "..odd", None, "Utility", False, ad)
+        self.assertEqual(subprocess.run([f"{ad}/AppRun"], capture_output=True, text=True).stdout.strip(), "odd")
+        for bad in ("..", "../run", "bin/../../run"):
+            with self.assertRaises(BuildError, msg=bad): M["preview"](d, "x", bad, None, "Utility", False)
+
     def test_build_runs_the_tool_and_returns_the_file(self):
         log = f"{self.t}/log"
         tool = self.ok_tool(f"{self.t}/appimagetool", f'echo "$ARCH $1" > {log}; test -x "$1/AppRun" || exit 1')

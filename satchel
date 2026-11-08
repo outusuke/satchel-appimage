@@ -1,11 +1,12 @@
 #!/usr/bin/python3
 # SPDX-License-Identifier: GPL-3.0-or-later
 # satchel - GTK4 + libadwaita front end for appimagetool: pick a program, name it, pick an icon, build an .AppImage.
-# It packs exactly what you give it. It does NOT copy in shared libraries, so the result runs where those libraries exist.
+# It packs exactly what you give it. It does NOT copy in shared libraries unless you ask (--bundle-libs, needs linuxdeploy),
+# so the result runs where those libraries exist.
 # Needs the appimagetool program: put it in your PATH (see README).
 # Usage: satchel                      (opens the window)
 #        satchel PROGRAM [--name N] [--exe E] [--icon I] [--category C] [--version V] [--comment T] [--terminal]
-#                             [--out DIR] [--sandbox] [--try [--seconds S]] [--dry-run] [-v]
+#                             [--bundle-libs] [--out DIR] [--sandbox] [--try [--seconds S]] [--dry-run] [-v]
 import collections, glob, hashlib, json, os, platform, re, shlex, shutil, signal, stat, struct, subprocess, sys, tarfile, tempfile, threading, time, unicodedata, zipfile, zlib
 
 CATEGORIES = ["Utility", "Development", "Graphics", "Network", "AudioVideo", "Office", "Game", "Education",
@@ -702,9 +703,12 @@ def check_inputs(src, name, exe, icon, category, version="", comment=""):
     src = os.path.realpath(src)
     if os.path.isdir(src):
         exe = os.path.normpath(exe or "")
-        if not exe or exe == "." or os.path.isabs(exe) or exe.startswith(".."): raise BuildError("Choose which program in the folder to start.")
+        if not exe or exe == "." or os.path.isabs(exe) or exe.split(os.sep)[0] == "..": raise BuildError("Choose which program in the folder to start.")
         if not (os.path.isfile(os.path.join(src, exe)) and os.access(os.path.join(src, exe), os.X_OK)):
             raise BuildError(f"'{exe}' is not an executable file inside the folder.")
+        real_exe = os.path.realpath(os.path.join(src, exe))
+        if outside_link(os.path.join(src, exe), src) or not real_exe.startswith(src + os.sep):
+            raise BuildError(f"'{exe}' is a symbolic link that leads outside the folder, so it would not be packed. Copy the real file into the folder.")
     elif os.path.isfile(src):
         if not os.access(src, os.X_OK): raise BuildError("That file is not executable (chmod +x it first).")
         exe = os.path.basename(src)
@@ -1121,7 +1125,7 @@ def cli(argv):
     """Build from the command line, no window. Prints the path of the AppImage; returns the exit code."""
     import argparse
     p = argparse.ArgumentParser(prog="satchel", description="Build an AppImage from a program file or folder (no window).")
-    p.add_argument("source", help="the program file, the folder that holds the program, or a .deb package")
+    p.add_argument("source", help="the program file, the folder that holds the program, or a .deb package, .tar.* archive or .zip file")
     p.add_argument("--name", help="app name (default: the file or folder name)")
     p.add_argument("--exe", default="", help="for a folder: the program to start, relative to the folder")
     p.add_argument("--icon", help="a .png or .svg file (default: the best one found inside the folder)")
