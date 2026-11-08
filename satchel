@@ -561,14 +561,34 @@ def package_info(root, hint=""):
 
 
 LINUXDEPLOY_URL = "https://github.com/linuxdeploy/linuxdeploy/releases"
+LD_DL = "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-{arch}.AppImage"
+LD_HOME = os.path.expanduser("~/.local/bin/linuxdeploy")
 
 
 def find_linuxdeploy():
-    """The linuxdeploy program found on PATH, or None."""
+    """The linuxdeploy program: on PATH, or the copy Satchel installed in ~/.local/bin (or one in ~/bin). None if none."""
     for n in ("linuxdeploy", f"linuxdeploy-{platform.machine()}.AppImage"):
         found = shutil.which(n)
         if found: return found
-    return None
+    return next((p for p in (LD_HOME, os.path.expanduser("~/bin/linuxdeploy")) if os.access(p, os.X_OK)), None)
+
+
+def find_linuxdeploy_download():
+    """A linuxdeploy file you already downloaded into ~/Downloads (newest first, no plugins), or None."""
+    d = os.path.expanduser("~/Downloads")
+    try: names = [f for f in os.listdir(d) if f.lower().startswith("linuxdeploy") and "plugin" not in f.lower()]
+    except OSError: return None
+    files = [f"{d}/{n}" for n in names if os.path.isfile(f"{d}/{n}")]
+    files.sort(key=lambda p: (platform.machine() not in os.path.basename(p), -os.path.getmtime(p)))
+    return files[0] if files else None
+
+
+def download_linuxdeploy(dest=None, opener=None):
+    """Download linuxdeploy for this machine and install it (~/.local/bin/linuxdeploy). Returns where it went."""
+    with tempfile.TemporaryDirectory(prefix="satchel-dl-") as d:
+        download(LD_DL.format(arch=platform.machine()), f"{d}/l", opener)
+        if appimage_offset(f"{d}/l") is None: raise BuildError("What was downloaded is not an AppImage, so it was not installed.")
+        return install_tool(f"{d}/l", dest or LD_HOME)
 
 
 def bundle_libraries(appdir, ident, exe, log=None, cancel=None):
@@ -1132,6 +1152,15 @@ def run_gui():
             self.rt_have.connect("clicked", lambda *_: self.choose_rt())
             for b in (self.rt_use, self.rt_get, self.rt_have): self.rt_row.add_suffix(b)
             g.add(self.rt_row)
+            self.ld_row = Adw.ActionRow(title="linuxdeploy", use_markup=False)
+            self.ld_use = Gtk.Button(valign=Gtk.Align.CENTER, css_classes=["suggested-action"])
+            self.ld_use.connect("clicked", lambda *_: self.install_ld(self.ld_dl))
+            self.ld_get = Gtk.Button(label="Download", valign=Gtk.Align.CENTER)
+            self.ld_get.connect("clicked", lambda *_: self.fetch(download_linuxdeploy, self.ld_get))
+            self.ld_have = Gtk.Button(label="Use a downloaded file…", valign=Gtk.Align.CENTER, css_classes=["flat"])
+            self.ld_have.connect("clicked", lambda *_: self.choose_ld())
+            for b in (self.ld_use, self.ld_get, self.ld_have): self.ld_row.add_suffix(b)
+            g.add(self.ld_row)
             self.tool_group = g
             self.box_row = Adw.SwitchRow(title="Run it in a bubblewrap sandbox", active=self.saved.get("sandbox", True), visible=bool(shutil.which("bwrap")),
                                          subtitle="Hides your home folder. No network once a runtime file is set")
@@ -1154,10 +1183,7 @@ def run_gui():
             self.cat_row = Adw.ComboRow(title="Category", model=Gtk.StringList.new(CATEGORIES))
             if self.saved.get("category"): self.cat_row.set_selected(CATEGORIES.index(self.saved["category"]))
             self.term_row = Adw.SwitchRow(title="Runs in a terminal", active=self.saved.get("terminal", False))
-            have_ld = bool(find_linuxdeploy())
-            self.bundle_row = Adw.SwitchRow(title="Bundle libraries (linuxdeploy)", active=False, sensitive=have_ld,
-                                            subtitle="Copies the libraries the program needs into the AppImage" if have_ld
-                                            else "linuxdeploy was not found: download it and put it in your PATH")
+            self.bundle_row = Adw.SwitchRow(title="Bundle libraries (linuxdeploy)", active=False, sensitive=False)
             for r in (self.name_row, self.ver_row, self.comment_row, self.icon_row, self.cat_row, self.term_row, self.bundle_row): g.add(r)
             page.add(g)
 
@@ -1254,6 +1280,15 @@ def run_gui():
             for b in (self.rt_get, self.rt_have): b.set_visible(not rt)
             self.rt_use.set_visible(not rt and bool(self.rt_dl))
             if self.rt_dl: self.rt_use.set_label("Use " + os.path.basename(self.rt_dl))
+            ld, self.ld_dl = find_linuxdeploy(), find_linuxdeploy_download()
+            self.ld_row.set_subtitle(ld or "Optional: only needed for Bundle libraries")
+            for b in (self.ld_get, self.ld_have): b.set_visible(not ld)
+            self.ld_use.set_visible(not ld and bool(self.ld_dl))
+            if self.ld_dl: self.ld_use.set_label("Use " + os.path.basename(self.ld_dl))
+            self.bundle_row.set_sensitive(bool(ld))
+            self.bundle_row.set_subtitle("Copies the libraries the program needs into the AppImage" if ld
+                                         else "Needs linuxdeploy: use the Download button in the tools section above")
+            if not ld: self.bundle_row.set_active(False)
 
         def install_rt(self, path):
             try: install_runtime(path)
@@ -1266,6 +1301,19 @@ def run_gui():
                 try: f = d.open_finish(res)
                 except GLib.Error: return
                 self.install_rt(f.get_path())
+            dlg.open(self, None, done)
+
+        def install_ld(self, path):
+            try: install_tool(path, LD_HOME)
+            except BuildError as e: return self.alert("Can't use that file", str(e))
+            self.refresh_tool(); self.toasts.add_toast(Adw.Toast(title="linuxdeploy is ready"))
+
+        def choose_ld(self):
+            dlg = self.dialog("Choose the linuxdeploy file you downloaded")
+            def done(d, res):
+                try: f = d.open_finish(res)
+                except GLib.Error: return
+                self.install_ld(f.get_path())
             dlg.open(self, None, done)
 
         def install(self, path):

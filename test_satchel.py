@@ -64,6 +64,7 @@ class Logic(unittest.TestCase):
         self._t = tempfile.TemporaryDirectory(); self.t = os.path.realpath(self._t.name)
         M["RUNTIME_DIR"] = f"{self.t}/rt"; M["MAX_DOWNLOAD"] = 200 * 1024 * 1024; os.environ.pop("APPIMAGE_RUNTIME", None)
         M["TOOL_HOME"] = f"{self.t}/nohome/appimagetool"            # never see the real ~/.local/bin/appimagetool
+        M["LD_HOME"] = f"{self.t}/nohome/linuxdeploy"               # nor the real linuxdeploy
     def tearDown(self): self._t.cleanup()
 
     def prog_folder(self):
@@ -689,6 +690,18 @@ class Logic(unittest.TestCase):
         self.assertTrue(os.path.isfile(f"{self.t}/A2/usr/lib/libbundled.so"))
         self.assertIn('"$HERE"/usr/lib', get(f"{self.t}/A2/AppRun"))
         self.assertEqual(M["packing_notes"](root, "usr/bin/fox", True).count("shared libraries"), 0)
+
+    def test_linuxdeploy_download_installs_a_real_appimage_only(self):
+        self.fake_appimage(f"{self.t}/good"); good = get(f"{self.t}/good", "rb")
+        dest = f"{self.t}/inst/linuxdeploy"
+        got = M["download_linuxdeploy"](dest, self.opener(good))
+        self.assertEqual(got, dest); self.assertTrue(os.access(dest, os.X_OK))
+        with self.assertRaisesRegex(BuildError, "not an AppImage"): M["download_linuxdeploy"](f"{self.t}/inst/x", self.opener(b"<html>"))
+        self.assertFalse(os.path.exists(f"{self.t}/inst/x"))
+        M["LD_HOME"] = dest; old = os.environ["PATH"]
+        try:
+            os.environ["PATH"] = f"{self.t}/emptybin"; self.assertEqual(M["find_linuxdeploy"](), dest)     # found without being on PATH
+        finally: os.environ["PATH"] = old
 
     def test_describe_run_explains_the_usual_causes(self):
         d = M["describe_run"]
