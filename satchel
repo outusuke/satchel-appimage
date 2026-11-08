@@ -1480,7 +1480,7 @@ def run_gui():
             else: self.alert("It works" if result[0] else "It did not start", result[1])
 
     class App(Adw.Application):
-        def __init__(self): super().__init__(application_id="io.github..Satchel")
+        def __init__(self): super().__init__()                  # no application id: not needed, only gives single-instance and D-Bus
         def do_activate(self): (self.props.active_window or Win(self)).present()
 
     return App().run(sys.argv[:1])
