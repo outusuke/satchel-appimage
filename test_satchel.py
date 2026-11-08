@@ -703,6 +703,19 @@ class Logic(unittest.TestCase):
             os.environ["PATH"] = f"{self.t}/emptybin"; self.assertEqual(M["find_linuxdeploy"](), dest)     # found without being on PATH
         finally: os.environ["PATH"] = old
 
+    def test_bundling_in_the_sandbox_runs_linuxdeploy_inside_bwrap_without_network(self):
+        os.makedirs(f"{self.t}/bin"); tool = script(f"{self.t}/bin/linuxdeploy", "exit 0\n")
+        seen, old_run, old_path = [], M["run_streaming"], os.environ["PATH"]
+        M["run_streaming"] = lambda cmd, *a, **k: (seen.append(cmd), (0, "", False))[1]
+        try:
+            os.environ["PATH"] = f"{self.t}/bin:{old_path}"
+            M["bundle_libraries"](f"{self.t}/work/AppDir", "x", "bin/x", None, None, "/usr/bin/bwrap")
+        finally: M["run_streaming"] = old_run; os.environ["PATH"] = old_path
+        cmd = seen[0]
+        self.assertEqual(cmd[0], "/usr/bin/bwrap"); self.assertNotIn("--share-net", cmd); self.assertIn("--unshare-all", cmd)
+        self.assertIn("APPIMAGE_EXTRACT_AND_RUN", cmd); self.assertEqual(cmd[cmd.index("--") + 1:][0], os.path.realpath(tool))
+        self.assertIn(f"{self.t}/work", cmd)                                               # the folder holding the AppDir is writable
+
     def test_describe_run_explains_the_usual_causes(self):
         d = M["describe_run"]
         self.assertIn("exec format error", d(126, "bash: x: cannot execute: Exec format error", False, 5, False).lower())

@@ -591,15 +591,19 @@ def download_linuxdeploy(dest=None, opener=None):
         return install_tool(f"{d}/l", dest or LD_HOME)
 
 
-def bundle_libraries(appdir, ident, exe, log=None, cancel=None):
-    """Run linuxdeploy on the AppDir so the libraries the program needs are copied into appdir/usr/lib."""
+def bundle_libraries(appdir, ident, exe, log=None, cancel=None, bwrap=None):
+    """Run linuxdeploy on the AppDir so the libraries the program needs are copied into appdir/usr/lib. With bwrap it runs
+    inside bubblewrap: no network, your home hidden, only the folder holding the AppDir writable."""
     tool = find_linuxdeploy()
     if not tool: raise BuildError(f"Bundling libraries needs linuxdeploy, which was not found. Download it from "
                                   f"{LINUXDEPLOY_URL}, make it executable and put it in your PATH.")
     if log: log("Copying libraries in (linuxdeploy)…")
     prog = f"{appdir}/usr/lib/{ident}/{os.path.normpath(exe)}"
-    code, text, _ = run_streaming([tool, "--appdir", appdir, "--executable", prog],
-                                  {**os.environ, "APPIMAGE_EXTRACT_AND_RUN": "1"}, os.path.dirname(appdir), log, cancel, 600)
+    cmd, env, work = [tool, "--appdir", appdir, "--executable", prog], {**os.environ, "APPIMAGE_EXTRACT_AND_RUN": "1"}, os.path.dirname(appdir)
+    if bwrap:
+        base = bwrap_base(bwrap, (tool,), work, platform.machine(), os.path.realpath(os.path.expanduser("~")), False)
+        cmd = base[:-3] + ["--setenv", "APPIMAGE_EXTRACT_AND_RUN", "1"] + base[-3:] + [os.path.realpath(tool), *cmd[1:]]
+    code, text, _ = run_streaming(cmd, env, work, log, cancel, 600, own_group=not bwrap)
     if code != 0: raise BuildError("linuxdeploy failed:\n" + text.strip()[-900:])
 
 
@@ -683,7 +687,7 @@ def preview(src, name, exe, icon, category, terminal, version="", comment="", bu
             apprun_script(ident, exe, app_libs(real, exe), usr_layout(real, exe), bundle))
 
 
-def make_appdir(src, name, exe, icon, category, terminal, appdir, version="", comment="", bundle=False, log=None, cancel=None):
+def make_appdir(src, name, exe, icon, category, terminal, appdir, version="", comment="", bundle=False, log=None, cancel=None, bwrap=None):
     """Lay out an AppDir in appdir (must not exist). src is a file or a folder; exe is the program to start,
     relative to the folder (ignored for a single file). With bundle, linuxdeploy copies the libraries the program needs into
     the AppDir. Returns the clean name used for files."""
@@ -699,7 +703,7 @@ def make_appdir(src, name, exe, icon, category, terminal, appdir, version="", co
     else: placeholder_icon(f"{appdir}/{ident}{ext}")
     shutil.copy2(f"{appdir}/{ident}{ext}", f"{appdir}/.DirIcon")
     with open(f"{appdir}/{ident}.desktop", "w") as f: f.write(desktop_file(ident, name, category, terminal, version, comment))
-    if bundle: bundle_libraries(appdir, ident, exe, log, cancel)
+    if bundle: bundle_libraries(appdir, ident, exe, log, cancel, bwrap)
     with open(f"{appdir}/AppRun", "w") as f: f.write(apprun_script(ident, exe, app_libs(src, exe), usr_layout(src, exe), bundle))
     os.chmod(f"{appdir}/AppRun", 0o755)
     return ident
@@ -986,7 +990,7 @@ def build(src, name, exe, icon, category, terminal, out_dir, tool=None, sandbox=
         tmp = os.path.realpath(tmp)
         appdir = f"{tmp}/AppDir"
         if log: log("Making the app folder…")
-        ident = make_appdir(src, name, exe, icon, category, terminal, appdir, version, comment, bundle, log, cancel)
+        ident = make_appdir(src, name, exe, icon, category, terminal, appdir, version, comment, bundle, log, cancel, bwrap)
         arch = platform.machine()
         stem = f"{ident}-{clean(version)}-{arch}" if version else f"{ident}-{arch}"
         built = f"{tmp}/{stem}.AppImage"
@@ -1032,7 +1036,7 @@ def try_run(src, name, exe, icon, category, terminal, sandbox=False, seconds=5, 
     with tempfile.TemporaryDirectory(prefix="satchel-try-") as tmp:
         tmp = os.path.realpath(tmp)
         appdir = f"{tmp}/AppDir"
-        make_appdir(src, name, exe, icon, category, terminal, appdir, "", "", bundle, log, cancel)   # the same checks as a build
+        make_appdir(src, name, exe, icon, category, terminal, appdir, "", "", bundle, log, cancel, bwrap)   # the same checks as a build
         cmd = [f"{appdir}/AppRun"]
         if bwrap: cmd = bwrap_base(bwrap, (), tmp, platform.machine(), os.path.realpath(os.path.expanduser("~")), False, display=True) + cmd
         code, text, timed_out = run_streaming(cmd, os.environ, tmp, log, cancel, seconds, False, own_group=not bwrap)
