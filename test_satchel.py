@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 Your Name
 # Tests for satchel's build logic (no GTK and no real appimagetool needed):   python3 test_satchel.py
-import contextlib, io, os, stat, struct, subprocess, tempfile, threading, time, unittest
+import contextlib, io, os, stat, struct, subprocess, tarfile, tempfile, threading, time, unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -30,6 +30,33 @@ def script(path, body):
     put(path, "#!/bin/sh\n" + body)
     os.chmod(path, 0o755)
     return path
+
+
+def make_deb(path, files, compress="xz"):
+    """A real .deb (ar archive: debian-binary, control.tar.gz, data.tar.<compress>). files: {name: bytes | ('link', target) |
+    ('exe', bytes)}."""
+    def tar_bytes(entries, comp):
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:" + comp) as tf:
+            for name, val in entries.items():
+                ti = tarfile.TarInfo(name)
+                if isinstance(val, tuple) and val[0] == "link": ti.type, ti.linkname = tarfile.SYMTYPE, val[1]; tf.addfile(ti)
+                else:
+                    data = val[1] if isinstance(val, tuple) else val
+                    ti.size, ti.mode = len(data), 0o755 if isinstance(val, tuple) else 0o644
+                    tf.addfile(ti, io.BytesIO(data))
+        return buf.getvalue()
+    members = [("debian-binary", b"2.0\n"), ("control.tar.gz", tar_bytes({"./control": b"Package: x\n"}, "gz")),
+               (f"data.tar.{compress}", tar_bytes(files, compress))]
+    out = b"!<arch>\n"
+    for name, data in members:
+        out += (name + "/").ljust(16).encode() + b"0".ljust(12) + b"0".ljust(6) + b"0".ljust(6) + b"100644".ljust(8) \
+               + str(len(data)).ljust(10).encode() + b"`\n" + data + (b"\n" if len(data) % 2 else b"")
+    with open(path, "wb") as f: f.write(out)
+    return path
+
+
+DESKTOP = b"[Desktop Entry]\nType=Application\nName=Fox Browser\nName[de]=Fuchs\nComment=Browse\nExec=/usr/bin/fox %u\nIcon=fox\nCategories=Network;WebBrowser;\n"
 
 
 class Logic(unittest.TestCase):
@@ -574,18 +601,94 @@ class Logic(unittest.TestCase):
             self.assertNotIn("--share-net", a)
         self.assertEqual(M["display_args"]({}), ([], []))                    # no screen: nothing is added
 
-    def test_find_icon_prefers_svg_then_the_largest_png(self):
+    def test_find_icon_scores_by_clues(self):
+        png = lambda path, n=256: (os.makedirs(os.path.dirname(path), exist_ok=True), M["placeholder_icon"](path))
         with tempfile.TemporaryDirectory() as d:
-            ic = os.path.join(d, "browser", "icons"); os.makedirs(ic)
-            M["placeholder_icon"](os.path.join(ic, "default256.png"))              # 256 px, real PNG
-            open(os.path.join(ic, "tiny.png"), "wb").write(b"\x89PNG\r\n\x1a\n" + b"x" * 40)   # not a real header: skipped
-            open(os.path.join(ic, "fake.png"), "w").write("text")
-            self.assertEqual(M["find_icon"](d), os.path.join(ic, "default256.png"))
-            svg = os.path.join(d, "app.svg"); open(svg, "w").write("<svg></svg>")
-            self.assertEqual(M["find_icon"](d), svg)
-            os.rename(svg, os.path.join(d, "app-symbolic.svg"))
-            self.assertEqual(M["find_icon"](d), os.path.join(ic, "default256.png"))
+            icons = os.path.join(d, "browser", "icons", "default128.png")
+            png(icons)
+            put(os.path.join(d, "fake.png"), "text")                       # not an image: skipped
+            self.assertEqual(M["find_icon"](d), icons)
+            png(os.path.join(d, "images", "splash.png"))                               # bad name and bad folder
+            self.assertEqual(M["find_icon"](d), icons)
+            png(os.path.join(d, "myapp.png"))                                          # matches the program name
+            self.assertEqual(M["find_icon"](d, ["myapp"]), os.path.join(d, "myapp.png"))
+            png(os.path.join(d, "share", "chosen.png"))                                # named by a .desktop file
+            put(os.path.join(d, "x.desktop"), "[Desktop Entry]\nName=X\nIcon=chosen\n")
+            self.assertEqual(M["find_icon"](d, ["myapp"]), os.path.join(d, "share", "chosen.png"))
+        with tempfile.TemporaryDirectory() as d:
+            svg = os.path.join(d, "a.svg"); put(svg, "<svg></svg>")
+            png(os.path.join(d, "b.png"))
+            self.assertEqual(M["find_icon"](d), svg)                                   # tie: svg counts as largest
+            os.rename(svg, os.path.join(d, "a-symbolic.svg"))
+            self.assertEqual(M["find_icon"](d), os.path.join(d, "b.png"))
         with tempfile.TemporaryDirectory() as d: self.assertIsNone(M["find_icon"](d))
+
+    def sample_deb(self, compress="xz"):
+        M["placeholder_icon"](f"{self.t}/ic.png")
+        return make_deb(f"{self.t}/fox_1.0_amd64.deb", {
+            "./usr/bin/fox": ("exe", b"#!/bin/sh\necho fox $XDG_DATA_DIRS\n"), "./usr/share/applications/fox.desktop": DESKTOP,
+            "./usr/share/icons/hicolor/256x256/apps/fox.png": get(f"{self.t}/ic.png", "rb"),
+            "./usr/share/doc/fox/splash.png": get(f"{self.t}/ic.png", "rb"),
+            "./usr/lib/fox/libfox.so": b"x", "./usr/bin/foxlink": ("link", "/usr/bin/fox")}, compress)
+
+    def test_unpack_deb_and_read_the_package(self):
+        for comp in ("xz", "gz", "bz2"):
+            root = f"{self.t}/root-{comp}"
+            M["unpack_package"](self.sample_deb(comp), root)
+            self.assertTrue(os.access(f"{root}/usr/bin/fox", os.X_OK))
+            self.assertEqual(os.readlink(f"{root}/usr/bin/foxlink"), "fox")             # absolute link rewritten to inside
+        info = M["package_info"](root, "fox")
+        self.assertEqual((info["exe"], info["name"], info["comment"], info["category"]), ("usr/bin/fox", "Fox Browser", "Browse", "Network"))
+        self.assertEqual(info["icon"], f"{root}/usr/share/icons/hicolor/256x256/apps/fox.png")
+        self.assertIn("usr/bin/fox", info["exes"])
+        self.assertTrue(M["is_package"](f"{self.t}/fox_1.0_amd64.deb")); self.assertEqual(M["package_hint"]("/x/fox_1.0_amd64.deb"), "fox")
+
+    def test_unpacking_never_writes_outside_the_folder(self):
+        evil = make_deb(f"{self.t}/evil.deb", {"../../escaped.txt": b"x", "./usr/bin/ok": ("exe", b"#!/bin/sh\n"),
+                                              "./usr/lib/up": ("link", "../../../../etc"), "./usr/lib/up/passwd": b"x"})
+        root = f"{self.t}/a/b/root"; os.makedirs(f"{self.t}/a/b")
+        M["unpack_package"](evil, root)
+        self.assertFalse(os.path.exists(f"{self.t}/a/escaped.txt") or os.path.exists(f"{self.t}/escaped.txt"))
+        self.assertFalse(os.path.islink(f"{root}/usr/lib/up"))                        # a link leading out is skipped
+        self.assertTrue(os.path.isfile(f"{root}/usr/lib/up/passwd"))                   # and the file after it stayed inside
+        self.assertTrue(os.path.isfile(f"{root}/usr/bin/ok"))
+        put(f"{self.t}/no.deb", "not a deb")
+        with self.assertRaisesRegex(BuildError, "not a .deb"): M["unpack_package"](f"{self.t}/no.deb", f"{self.t}/r2")
+        with self.assertRaisesRegex(BuildError, "Only .deb"): M["unpack_package"](f"{self.t}/x.rpm", f"{self.t}/r3")
+
+    def test_package_layout_apprun_and_preview(self):
+        root = f"{self.t}/root"; M["unpack_package"](self.sample_deb(), root)
+        ident, desktop, apprun = M["preview"](root, "Fox Browser", "usr/bin/fox", None, "Network", False)
+        self.assertIn("XDG_DATA_DIRS", apprun); self.assertIn("usr/share", apprun); self.assertIn("usr/lib/fox", apprun)
+        self.assertNotIn("usr/lib\"", apprun.split("LD_LIBRARY_PATH=")[1].split("\n")[0])
+        plain = M["apprun_script"]("a", "run", [])
+        self.assertNotIn("XDG_DATA_DIRS", plain); self.assertNotIn("APP=", plain)         # an ordinary folder is unchanged
+        self.assertIn('"$HERE"/usr/lib', M["apprun_script"]("a", "run", [], False, True))
+
+    def test_cli_takes_a_deb_and_fills_in_what_the_package_says(self):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.assertEqual(M["cli"]([self.sample_deb(), "--dry-run"]), 0)
+        self.assertIn("Name=Fox Browser", out.getvalue()); self.assertIn("Categories=Network;", out.getvalue())
+        self.assertIn("usr/bin/fox", out.getvalue()); self.assertIn("From the package", err.getvalue())
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err): self.assertEqual(M["cli"]([f"{self.t}/no.deb", "--dry-run"]), 1)
+
+    def test_bundling_runs_linuxdeploy_and_needs_it(self):
+        root = f"{self.t}/root"; M["unpack_package"](self.sample_deb(), root)
+        old = os.environ["PATH"]
+        try:
+            os.environ["PATH"] = f"{self.t}/emptybin"
+            with self.assertRaisesRegex(BuildError, "linuxdeploy"):
+                M["make_appdir"](root, "Fox", "usr/bin/fox", None, "Network", False, f"{self.t}/A1", "", "", True)
+            os.makedirs(f"{self.t}/bin")
+            script(f"{self.t}/bin/linuxdeploy", 'mkdir -p "$2/usr/lib"; echo bundled > "$2/usr/lib/libbundled.so"\n')
+            os.environ["PATH"] = f"{self.t}/bin:{old}"
+            M["make_appdir"](root, "Fox", "usr/bin/fox", None, "Network", False, f"{self.t}/A2", "", "", True)
+        finally: os.environ["PATH"] = old
+        self.assertTrue(os.path.isfile(f"{self.t}/A2/usr/lib/libbundled.so"))
+        self.assertIn('"$HERE"/usr/lib', get(f"{self.t}/A2/AppRun"))
+        self.assertEqual(M["packing_notes"](root, "usr/bin/fox", True).count("shared libraries"), 0)
 
     def test_describe_run_explains_the_usual_causes(self):
         d = M["describe_run"]
@@ -746,6 +849,23 @@ class Window(unittest.TestCase):
         self.assertTrue(self.w.dropped(None, Dropped(fake), 0, 0)); self.assertEqual(self.w.icon, icon)    # refused, kept the old one
         self.assertEqual(self.alerts[-1].kw["heading"], "Can't use that icon")
         self.assertFalse(self.w.dropped(None, Dropped(f"{self.t}/nope"), 0, 0)); self.assertFalse(self.w.dropped(None, None, 0, 0))
+
+    def test_dropping_a_deb_fills_the_form_from_the_package(self):
+        import time as _t
+        class Dropped:
+            def __init__(self, p): self.p = p
+            def get_path(self): return self.p
+        M["placeholder_icon"](f"{self.t}/ic.png")
+        deb = make_deb(f"{self.t}/fox_1.0_amd64.deb", {"./usr/bin/fox": ("exe", b"#!/bin/sh\n"), "./usr/share/applications/fox.desktop": DESKTOP,
+                                                      "./usr/share/icons/hicolor/256x256/apps/fox.png": get(f"{self.t}/ic.png", "rb")})
+        self.assertTrue(self.w.dropped(None, Dropped(deb), 0, 0))
+        for _ in range(100):
+            if self.w.pkg_tmp: break
+            _t.sleep(0.1)
+        self.assertTrue(self.w.src.endswith("/root")); self.assertEqual(self.w.exes, ["usr/bin/fox"])
+        self.assertTrue(self.w.icon.endswith("fox.png")); self.assertTrue(self.w.go.get_sensitive())
+        tmp = self.w.pkg_tmp; self.w.set_source(self.folder("other"))                       # opening another program removes the unpacked one
+        self.assertFalse(os.path.exists(tmp)); self.assertIsNone(self.w.pkg_tmp)
 
     def test_preview_shows_the_files_and_refuses_bad_input(self):
         self.w.preview_it(); self.assertEqual(self.alerts[-1].kw["heading"], "Nothing to preview")

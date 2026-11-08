@@ -7,7 +7,7 @@
 # Usage: satchel                      (opens the window)
 #        satchel PROGRAM [--name N] [--exe E] [--icon I] [--category C] [--version V] [--comment T] [--terminal]
 #                             [--out DIR] [--sandbox] [--try [--seconds S]] [--dry-run] [-v]
-import collections, glob, hashlib, json, os, platform, re, shlex, shutil, signal, struct, subprocess, sys, tempfile, threading, time, unicodedata, zlib
+import collections, glob, hashlib, json, os, platform, re, shlex, shutil, signal, struct, subprocess, sys, tarfile, tempfile, threading, time, unicodedata, zlib
 
 CATEGORIES = ["Utility", "Development", "Graphics", "Network", "AudioVideo", "Office", "Game", "Education",
               "Science", "System", "Settings"]
@@ -145,13 +145,13 @@ def links_note(links):
             "left out of the AppImage: " + shown + ". If the program needs them, copy the real files into the folder.")
 
 
-def packing_notes(src, exe):
+def packing_notes(src, exe, bundle=False):
     """All the warnings for the result message (wrong kind of computer, missing libraries, links left out, very big
     folder), joined;
     '' when there are none."""
     prog = os.path.join(src, exe) if os.path.isdir(src) else src
     links = outside_links(src) if os.path.isdir(src) else []
-    notes = (arch_problem(prog) if os.path.isfile(prog) else "", missing_note(missing_libraries(src, exe)), links_note(links),
+    notes = (arch_problem(prog) if os.path.isfile(prog) else "", ("" if bundle else missing_note(missing_libraries(src, exe))), links_note(links),
              size_note(src))
     return "\n\n".join(n for n in notes if n)
 
@@ -177,29 +177,66 @@ def png_size(path):
     return struct.unpack(">II", head[16:24])
 
 
-def find_icon(folder, min_px=48, depth=4, limit=3000):
-    """The best icon inside a program folder, or None: a .svg if there is one (shallowest first, not a -symbolic one),
-    otherwise the largest real .png of at least min_px (read from the image header, not the file name). Looks at most
-    depth folders down and at most limit files."""
-    base, svgs, pngs, seen = os.path.realpath(folder), [], [], 0
-    if not os.path.isdir(base): return None
+GOOD_ICON_WORDS = ("icon", "logo", "default", "appicon")
+BAD_ICON_WORDS = ("splash", "banner", "background", "screenshot", "wallpaper", "header", "thumb", "preview", "symbolic",
+                  "sprite", "cursor", "tray", "mask")
+GOOD_ICON_DIRS = ("icons", "icon", "hicolor", "pixmaps", "apps")
+BAD_ICON_DIRS = ("images", "img", "doc", "docs", "help", "screenshots", "samples", "examples", "test", "tests")
+
+
+def desktop_icon_names(folder, depth=4):
+    """The Icon= values of the .desktop files inside folder (name or absolute path as written)."""
+    base, out = os.path.realpath(folder), []
     for root, dirs, files in os.walk(base):
-        level = root[len(base):].count(os.sep)
-        if level >= depth: dirs[:] = []
+        if root[len(base):].count(os.sep) >= depth: dirs[:] = []
+        for fn in files:
+            if not fn.endswith(".desktop"): continue
+            try:
+                with open(os.path.join(root, fn), encoding="utf-8", errors="replace") as f: text = f.read(20000)
+            except OSError: continue
+            m = re.search(r"^Icon\s*=\s*(.+?)\s*$", text, re.M)
+            if m: out.append(m.group(1))
+    return out
+
+
+def find_icon(folder, hints=(), min_px=48, depth=4, limit=3000, extra_names=()):
+    """The most likely icon inside a program folder, or None. Every real .png/.svg (checked by content; a .png is at
+    least min_px) is scored by clues: an Icon= line in a .desktop file in the folder is the strongest; a file name
+    that matches the program (hints) or says icon/logo is good; splash, banner, screenshot and similar names are bad;
+    an icons/ folder is good, images/ or docs/ is bad; a square image is better. Ties go to the larger image, and
+    an .svg counts as the largest. Looks at most depth folders down and at most limit files."""
+    base, cands, seen = os.path.realpath(folder), [], 0
+    if not os.path.isdir(base): return None
+    named = [*desktop_icon_names(base, depth), *extra_names]
+    names = {os.path.splitext(os.path.basename(n))[0].lower() for n in named}
+    paths = {os.path.realpath(n) for n in named if os.path.isabs(n)}
+    hint_stems = {os.path.splitext(os.path.basename(h))[0].lower() for h in hints if h}
+    for root, dirs, files in os.walk(base):
+        parts = [x.lower() for x in root[len(base):].split(os.sep) if x]
+        if len(parts) >= depth: dirs[:] = []
         dirs.sort()
         for fn in sorted(files):
             seen += 1
             if seen > limit: break
-            path, ext = os.path.join(root, fn), os.path.splitext(fn)[1].lower()
-            if ext not in ICON_EXT or os.path.islink(path) or icon_problem(path): continue
-            if ext == ".svg":
-                if "-symbolic" not in fn.lower(): svgs.append((level, path))
+            path, (stem, ext) = os.path.join(root, fn), os.path.splitext(fn)
+            low = stem.lower()
+            if ext.lower() not in ICON_EXT or os.path.islink(path) or icon_problem(path): continue
+            if ext.lower() == ".svg": size, square = 4096, True
             else:
-                size = png_size(path)
-                if size and min(size) >= min_px: pngs.append((-min(size), level, path))
+                wh = png_size(path)
+                if not wh or min(wh) < min_px: continue
+                size, square = min(wh), wh[0] == wh[1]
+            score = 0
+            if os.path.realpath(path) in paths or low in names: score += 100
+            if low in hint_stems or any(h and low.startswith(h) for h in hint_stems): score += 50
+            if any(w in low for w in GOOD_ICON_WORDS): score += 20
+            if any(w in low for w in BAD_ICON_WORDS): score -= 60
+            if any(d in GOOD_ICON_DIRS for d in parts): score += 15
+            if any(d in BAD_ICON_DIRS for d in parts): score -= 15
+            if square: score += 10
+            cands.append((score, size, -len(parts), path))
         if seen > limit: break
-    if svgs: return min(svgs)[1]
-    return min(pngs)[2] if pngs else None
+    return max(cands)[3] if cands else None
 
 
 def find_executables(folder):
@@ -220,14 +257,14 @@ def _is_lib(name):
     return name.endswith(".so") or ".so." in name
 
 
-def library_dirs(folder):
+def library_dirs(folder, max_depth=3):
     """Folders inside the program folder (at most three deep) that hold shared libraries, as paths relative to it
     ('.' is the folder itself), shallowest first. Names with a colon are skipped: they cannot go into LD_LIBRARY_PATH."""
     base, out = os.path.realpath(folder), []
     for root, dirs, files in os.walk(base):
         rel = os.path.relpath(root, base)
         depth = 0 if rel == "." else rel.count(os.sep) + 1
-        if depth >= 3: dirs[:] = []
+        if depth >= max_depth: dirs[:] = []
         if ":" not in rel and any(_is_lib(f) for f in files): out.append((depth, rel))
     return [rel for _, rel in sorted(out)[:30]]
 
@@ -360,6 +397,192 @@ def missing_note(missing):
             + ". The AppImage will only run where they exist.")
 
 
+# ---- packages (.deb): unpacked into a folder, then handled like any program folder ----
+PKG_EXT = (".deb",)
+MAX_UNPACKED = 8 << 30
+CATEGORY_MAP = {"Utility": "Utility", "TextEditor": "Utility", "Development": "Development", "IDE": "Development",
+                "Graphics": "Graphics", "Network": "Network", "WebBrowser": "Network", "Email": "Network",
+                "AudioVideo": "AudioVideo", "Audio": "AudioVideo", "Video": "AudioVideo", "Player": "AudioVideo",
+                "Office": "Office", "Game": "Game", "Education": "Education", "Science": "Science",
+                "System": "System", "Settings": "Settings"}
+
+
+def is_package(path):
+    return os.path.isfile(path) and path.lower().endswith(PKG_EXT)
+
+
+def package_hint(path):
+    """The package name from a file name like firefox_159.0.1_amd64.deb."""
+    return os.path.splitext(os.path.basename(path))[0].split("_")[0]
+
+
+def ar_members(f):
+    """(name, data offset, size) of each member of an ar archive (a .deb is one)."""
+    if f.read(8) != b"!<arch>\n": raise BuildError("That file is not a .deb package (it is not an ar archive).")
+    while True:
+        head = f.read(60)
+        if len(head) < 60: return
+        try: size = int(head[48:58])
+        except ValueError: size = -1
+        if head[58:60] != b"`\n" or size < 0: raise BuildError("The .deb package is damaged (bad archive header).")
+        start = f.tell()
+        yield head[:16].decode("ascii", "replace").strip().rstrip("/"), start, size
+        f.seek(start + size + (size & 1))
+
+
+def _tar_ready(raw, name, work):
+    """A tar file tarfile can open: gz, bz2 and xz are read directly, zstd is unpacked first."""
+    kind = name[len("data.tar"):]
+    if kind in ("", ".gz", ".bz2", ".xz"): return raw
+    if kind != ".zst": raise BuildError(f"This package uses a compression Satchel does not know ({name}).")
+    out = f"{work}/data.tar"
+    try:
+        from compression import zstd                                    # Python 3.14 and later
+        with zstd.open(raw, "rb") as s_, open(out, "wb") as o: shutil.copyfileobj(s_, o)
+        return out
+    except ImportError: pass
+    z = shutil.which("zstd")
+    if not z: raise BuildError(f"zstd is needed to unpack this package: {install_hint('zstd')}")
+    r = subprocess.run([z, "-d", "-q", "-f", "-o", out, raw], capture_output=True, text=True, errors="replace",
+                       stdin=subprocess.DEVNULL, timeout=600)
+    if r.returncode != 0: raise BuildError("Could not unpack the package:\n" + (r.stderr or r.stdout).strip()[-400:])
+    return out
+
+
+def extract_tar(tar_path, dest):
+    """Unpack a tar into dest safely: nothing is written outside dest (no .., no writing through links), absolute
+    links are rewritten to point inside dest, device files and the like are skipped, and the total size is limited."""
+    base, total = os.path.realpath(dest), 0
+    inside = lambda p: p == base or p.startswith(base + os.sep)
+    os.makedirs(base, exist_ok=True)
+    try:
+        with tarfile.open(tar_path, "r:*") as tar:
+            for m in tar:
+                parts = [x for x in m.name.split("/") if x not in ("", ".")]
+                if not parts or ".." in parts: continue
+                target = os.path.join(base, *parts)
+                parent = os.path.dirname(target)
+                if not inside(os.path.realpath(parent)): continue
+                if m.isdir():
+                    if os.path.islink(target): continue
+                    os.makedirs(target, exist_ok=True); os.chmod(target, (m.mode & 0o777) | 0o700)
+                    continue
+                os.makedirs(parent, exist_ok=True)
+                if m.isreg():
+                    total += m.size
+                    if total > MAX_UNPACKED: raise BuildError("The package is unpacked larger than 8 GB, so it was not unpacked.")
+                    if os.path.lexists(target): os.remove(target)
+                    with tar.extractfile(m) as src_, open(target, "wb") as out: shutil.copyfileobj(src_, out)
+                    os.chmod(target, (m.mode & 0o777) | 0o600)
+                elif m.issym():
+                    link = m.linkname
+                    if os.path.isabs(link): link = os.path.relpath(os.path.join(base, link.lstrip("/")), parent)
+                    if not inside(os.path.normpath(os.path.join(parent, link))): continue
+                    if os.path.lexists(target): os.remove(target)
+                    os.symlink(link, target)
+                elif m.islnk():
+                    srcp = os.path.join(base, *[x for x in m.linkname.split("/") if x not in ("", ".")])
+                    if inside(os.path.realpath(srcp)) and os.path.isfile(srcp):
+                        if os.path.lexists(target): os.remove(target)
+                        shutil.copy2(srcp, target)
+    except BuildError: raise
+    except Exception as e: raise BuildError(f"Could not unpack the package: {e}")
+
+
+def unpack_deb(path, dest):
+    """Unpack a .deb (its data.tar.*) into dest, with Python's own tools (a .zst package also needs zstd)."""
+    parent = os.path.dirname(os.path.abspath(dest))
+    try:
+        with open(path, "rb") as f:
+            for name, off, size in ar_members(f):
+                if name.startswith("data.tar"): break
+            else: raise BuildError("There is no data.tar inside that file, so it is not a usable .deb package.")
+            with tempfile.TemporaryDirectory(prefix="satchel-deb-", dir=parent) as work:
+                raw = f"{work}/data"
+                f.seek(off)
+                with open(raw, "wb") as o:
+                    left = size
+                    while left > 0:
+                        chunk = f.read(min(left, 1 << 20))
+                        if not chunk: raise BuildError("The .deb package is cut short (damaged download?).")
+                        o.write(chunk); left -= len(chunk)
+                extract_tar(_tar_ready(raw, name, work), dest)
+    except OSError as e: raise BuildError(f"Could not read the package: {e}")
+
+
+def unpack_package(path, dest):
+    if path.lower().endswith(".deb"): return unpack_deb(path, dest)
+    raise BuildError("Only .deb packages can be opened so far.")
+
+
+def parse_desktop(path):
+    """The keys of the [Desktop Entry] group of a .desktop file (first value of each, translations left out)."""
+    out, inside = {}, False
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f: text = f.read(50000)
+    except OSError: return out
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("["): inside = line == "[Desktop Entry]"
+        elif inside and "=" in line and not line.startswith("#"):
+            k, _, v = line.partition("=")
+            if "[" not in k: out.setdefault(k.strip(), v.strip())
+    return out
+
+
+def package_info(root, hint=""):
+    """What an unpacked package says about itself: its programs (usr/bin, usr/games, opt), the one to start, and the
+    name, description, category, terminal flag and icon from its .desktop file. Missing things are '' or None."""
+    root = os.path.realpath(root)
+    every = find_executables(root)
+    exes = [e for e in every if e.startswith(("usr/bin/", "usr/games/", "opt/"))] or every
+    by_name = {os.path.basename(e): e for e in exes}
+    entries, apps = [], os.path.join(root, "usr/share/applications")
+    if os.path.isdir(apps):
+        for fn in sorted(os.listdir(apps)):
+            d = parse_desktop(os.path.join(apps, fn)) if fn.endswith(".desktop") else {}
+            if d.get("Type", "Application") == "Application" and d.get("NoDisplay", "").lower() != "true": entries.append(d)
+    def exec_name(d):
+        words = [w for w in d.get("Exec", "").split() if w != "env" and "=" not in w]
+        return os.path.basename(words[0]) if words else ""
+    entry = next((d for d in entries if exec_name(d) in by_name), entries[0] if entries else {})
+    exe = by_name.get(exec_name(entry)) or by_name.get(hint) or (exes[0] if exes else "")
+    icon_name = entry.get("Icon", "")
+    names = [icon_name] if icon_name else []
+    hints = [os.path.basename(exe), hint, *names]
+    icon = None
+    for sub in ("usr/share/icons", "usr/share/pixmaps", "opt", ""):
+        d = os.path.join(root, sub)
+        if os.path.isdir(d): icon = find_icon(d, hints, depth=7, limit=20000, extra_names=names)
+        if icon: break
+    category = next((CATEGORY_MAP[c] for c in entry.get("Categories", "").split(";") if c in CATEGORY_MAP), "")
+    return {"exes": exes, "exe": exe, "name": entry.get("Name", ""), "comment": entry.get("Comment", ""),
+            "category": category, "terminal": entry.get("Terminal", "").lower() == "true", "icon": icon}
+
+
+LINUXDEPLOY_URL = "https://github.com/linuxdeploy/linuxdeploy/releases"
+
+
+def find_linuxdeploy():
+    """The linuxdeploy program found on PATH, or None."""
+    for n in ("linuxdeploy", f"linuxdeploy-{platform.machine()}.AppImage"):
+        found = shutil.which(n)
+        if found: return found
+    return None
+
+
+def bundle_libraries(appdir, ident, exe, log=None, cancel=None):
+    """Run linuxdeploy on the AppDir so the libraries the program needs are copied into appdir/usr/lib."""
+    tool = find_linuxdeploy()
+    if not tool: raise BuildError(f"Bundling libraries needs linuxdeploy, which was not found. Download it from "
+                                  f"{LINUXDEPLOY_URL}, make it executable and put it in your PATH.")
+    if log: log("Copying libraries in (linuxdeploy)…")
+    prog = f"{appdir}/usr/lib/{ident}/{os.path.normpath(exe)}"
+    code, text, _ = run_streaming([tool, "--appdir", appdir, "--executable", prog],
+                                  {**os.environ, "APPIMAGE_EXTRACT_AND_RUN": "1"}, os.path.dirname(appdir), log, cancel, 600)
+    if code != 0: raise BuildError("linuxdeploy failed:\n" + text.strip()[-900:])
+
+
 def placeholder_icon(dst):
     """A plain 256x256 PNG square (appimagetool wants a PNG for .DirIcon)."""
     n, bg, fg = 256, bytes((0x3B, 0x42, 0x52, 255)), bytes((0xEC, 0xEF, 0xF4, 255))
@@ -405,27 +628,45 @@ def desktop_file(ident, name, category, terminal, version="", comment=""):
             + (f"X-AppImage-Version={desktop_text(version)}\n" if version else ""))
 
 
-def apprun_script(ident, exe, libs):
-    """The text of AppRun: it starts the program, with LD_LIBRARY_PATH pointing at the .so folders packed next to it."""
+def usr_layout(src, exe):
+    """True when src is an unpacked package: a usr/ tree with share/ in it and a program under usr/ or opt/."""
+    return (os.path.isdir(os.path.join(src, "usr", "share"))
+            and os.path.normpath(exe or "").replace(os.sep, "/").startswith(("usr/", "opt/")))
+
+
+def apprun_script(ident, exe, libs, usr=False, bundled=False):
+    """The text of AppRun: it starts the program, with LD_LIBRARY_PATH pointing at the .so folders packed next to it.
+    usr (an unpacked package) also puts the package's usr/bin and usr/share on PATH and XDG_DATA_DIRS; bundled adds
+    the folder linuxdeploy copied libraries into."""
     out = '#!/bin/sh\nHERE="$(dirname "$(readlink -f "$0")")"\n'
-    if libs:                                        # let the program find the .so files packed next to it
-        parts = ":".join('"$APP"' if r == "." else '"$APP"/' + shlex.quote(r) for r in libs)
-        out += (f'APP="$HERE"/{shlex.quote(f"usr/lib/{ident}")}\n'
-                f'LD_LIBRARY_PATH={parts}"${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}"; export LD_LIBRARY_PATH\n')
+    if libs or usr or bundled: out += f'APP="$HERE"/{shlex.quote(f"usr/lib/{ident}")}\n'
+    parts = [('"$APP"' if r == "." else '"$APP"/' + shlex.quote(r)) for r in libs] + (['"$HERE"/usr/lib'] if bundled else [])
+    if parts:                                       # let the program find the .so files packed next to it
+        out += f'LD_LIBRARY_PATH={":".join(parts)}"${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}"; export LD_LIBRARY_PATH\n'
+    if usr:
+        out += ('PATH="$APP"/usr/bin:"$APP"/usr/games"${PATH:+:$PATH}"; export PATH\n'
+                'XDG_DATA_DIRS="$APP"/usr/share:"${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"; export XDG_DATA_DIRS\n')
     return out + f'exec "$HERE"/{shlex.quote(f"usr/lib/{ident}/{exe}")} "$@"\n'
 
 
-def preview(src, name, exe, icon, category, terminal, version="", comment=""):
+def app_libs(src, exe):
+    """The .so folders to put on LD_LIBRARY_PATH (a package is searched deeper)."""
+    return library_dirs(src, 5 if usr_layout(src, exe) else 3) if os.path.isdir(src) else []
+
+
+def preview(src, name, exe, icon, category, terminal, version="", comment="", bundle=False):
     """(clean name, .desktop text, AppRun text) exactly as a build would write them, with the same checks and without
     copying anything."""
     name, version, comment, ident, exe, _ext = check_inputs(src, name, exe, icon, category, version, comment)
-    libs = library_dirs(src) if os.path.isdir(os.path.realpath(src)) else []
-    return ident, desktop_file(ident, name, category, terminal, version, comment), apprun_script(ident, exe, libs)
+    real = os.path.realpath(src)
+    return (ident, desktop_file(ident, name, category, terminal, version, comment),
+            apprun_script(ident, exe, app_libs(real, exe), usr_layout(real, exe), bundle))
 
 
-def make_appdir(src, name, exe, icon, category, terminal, appdir, version="", comment=""):
+def make_appdir(src, name, exe, icon, category, terminal, appdir, version="", comment="", bundle=False, log=None, cancel=None):
     """Lay out an AppDir in appdir (must not exist). src is a file or a folder; exe is the program to start,
-    relative to the folder (ignored for a single file). Returns the clean name used for files."""
+    relative to the folder (ignored for a single file). With bundle, linuxdeploy copies the libraries the program needs into
+    the AppDir. Returns the clean name used for files."""
     name, version, comment, ident, exe, ext = check_inputs(src, name, exe, icon, category, version, comment)
     src = os.path.realpath(src)
     lib = f"{appdir}/usr/lib/{ident}"
@@ -438,7 +679,8 @@ def make_appdir(src, name, exe, icon, category, terminal, appdir, version="", co
     else: placeholder_icon(f"{appdir}/{ident}{ext}")
     shutil.copy2(f"{appdir}/{ident}{ext}", f"{appdir}/.DirIcon")
     with open(f"{appdir}/{ident}.desktop", "w") as f: f.write(desktop_file(ident, name, category, terminal, version, comment))
-    with open(f"{appdir}/AppRun", "w") as f: f.write(apprun_script(ident, exe, library_dirs(src) if os.path.isdir(src) else []))
+    if bundle: bundle_libraries(appdir, ident, exe, log, cancel)
+    with open(f"{appdir}/AppRun", "w") as f: f.write(apprun_script(ident, exe, app_libs(src, exe), usr_layout(src, exe), bundle))
     os.chmod(f"{appdir}/AppRun", 0o755)
     return ident
 
@@ -707,7 +949,7 @@ def run_streaming(cmd, env, cwd, log=None, cancel=None, timeout=600, timeout_is_
     return (None if why else p.returncode), text, why == "timeout"
 
 
-def build(src, name, exe, icon, category, terminal, out_dir, tool=None, sandbox=False, version="", log=None, cancel=None, comment=""):
+def build(src, name, exe, icon, category, terminal, out_dir, tool=None, sandbox=False, version="", log=None, cancel=None, comment="", bundle=False):
     """Make the AppDir in a temporary folder, run appimagetool on it (optionally inside bubblewrap), and move the
     result to out_dir. Returns the path of the .AppImage. A version goes into the desktop file, the file name and
     the VERSION variable that appimagetool reads; a comment goes into the desktop file. log(line) is called with the tool's output while it runs; setting
@@ -724,7 +966,7 @@ def build(src, name, exe, icon, category, terminal, out_dir, tool=None, sandbox=
         tmp = os.path.realpath(tmp)
         appdir = f"{tmp}/AppDir"
         if log: log("Making the app folder…")
-        ident = make_appdir(src, name, exe, icon, category, terminal, appdir, version, comment)
+        ident = make_appdir(src, name, exe, icon, category, terminal, appdir, version, comment, bundle, log, cancel)
         arch = platform.machine()
         stem = f"{ident}-{clean(version)}-{arch}" if version else f"{ident}-{arch}"
         built = f"{tmp}/{stem}.AppImage"
@@ -762,7 +1004,7 @@ def describe_run(code, text, timed_out, seconds, sandboxed):
     return "\n".join(lines) + (f"\n\nOutput:\n{tail}" if tail else "")
 
 
-def try_run(src, name, exe, icon, category, terminal, sandbox=False, seconds=5, log=None, cancel=None):
+def try_run(src, name, exe, icon, category, terminal, sandbox=False, seconds=5, log=None, cancel=None, bundle=False):
     """Start the packed program the way the AppImage would and watch it for a few seconds (inside bubblewrap, with no
     network and your home hidden but your screen shared, when sandbox is on). Returns (ok, a description); ok means it ran fine or was still
     running when the time was up. It catches a wrong program, a missing library or a format error before you build."""
@@ -770,7 +1012,7 @@ def try_run(src, name, exe, icon, category, terminal, sandbox=False, seconds=5, 
     with tempfile.TemporaryDirectory(prefix="satchel-try-") as tmp:
         tmp = os.path.realpath(tmp)
         appdir = f"{tmp}/AppDir"
-        make_appdir(src, name, exe, icon, category, terminal, appdir)             # the same checks as a build
+        make_appdir(src, name, exe, icon, category, terminal, appdir, "", "", bundle, log, cancel)   # the same checks as a build
         cmd = [f"{appdir}/AppRun"]
         if bwrap: cmd = bwrap_base(bwrap, (), tmp, platform.machine(), os.path.realpath(os.path.expanduser("~")), False, display=True) + cmd
         code, text, timed_out = run_streaming(cmd, os.environ, tmp, log, cancel, seconds, False, own_group=not bwrap)
@@ -781,14 +1023,15 @@ def cli(argv):
     """Build from the command line, no window. Prints the path of the AppImage; returns the exit code."""
     import argparse
     p = argparse.ArgumentParser(prog="satchel", description="Build an AppImage from a program file or folder (no window).")
-    p.add_argument("source", help="the program file, or the folder that holds the program")
+    p.add_argument("source", help="the program file, the folder that holds the program, or a .deb package")
     p.add_argument("--name", help="app name (default: the file or folder name)")
     p.add_argument("--exe", default="", help="for a folder: the program to start, relative to the folder")
     p.add_argument("--icon", help="a .png or .svg file (default: the best one found inside the folder)")
-    p.add_argument("--category", default="Utility", choices=CATEGORIES)
+    p.add_argument("--category", choices=CATEGORIES, help="default: from the package, else Utility")
     p.add_argument("--version", default="", help="goes into the file name and the desktop file")
     p.add_argument("--comment", default="", help="a short description for the desktop file")
     p.add_argument("--terminal", action="store_true", help="the app runs in a terminal")
+    p.add_argument("--bundle-libs", action="store_true", help="copy the libraries the program needs into the AppImage (needs linuxdeploy)")
     p.add_argument("--out", default=".", help="folder for the result (default: here)")
     p.add_argument("--sandbox", action="store_true", help="run appimagetool (or the test run) inside bubblewrap")
     p.add_argument("--try", dest="try_first", action="store_true",
@@ -797,24 +1040,48 @@ def cli(argv):
     p.add_argument("--dry-run", action="store_true", help="only print the .desktop file and AppRun that would be made; builds nothing")
     p.add_argument("-v", "--verbose", action="store_true", help="show the output while it runs")
     a = p.parse_args(argv)
+    if not is_package(a.source):
+        a.category = a.category or "Utility"
+        return cli_run(a)
+    with tempfile.TemporaryDirectory(prefix="satchel-pkg-") as t:
+        root = f"{t}/root"
+        try: unpack_package(a.source, root)
+        except BuildError as e:
+            print(e, file=sys.stderr)
+            return 1
+        hint = package_hint(a.source)
+        info = package_info(root, hint)
+        if not (a.exe or info["exe"]):
+            print("No program was found inside that package.", file=sys.stderr)
+            return 1
+        a.name, a.exe = a.name or info["name"] or hint, a.exe or info["exe"]
+        a.icon, a.comment = a.icon or info["icon"], a.comment or info["comment"]
+        a.category, a.terminal = a.category or info["category"] or "Utility", a.terminal or info["terminal"]
+        print(f"From the package: program {a.exe}, name {a.name}" + (f", icon {os.path.relpath(a.icon, root)}" if a.icon else ""),
+              file=sys.stderr)
+        a.source = root
+        return cli_run(a)
+
+
+def cli_run(a):
     name = a.name or default_name(os.path.realpath(a.source))
     log = (lambda line: print(line, file=sys.stderr)) if a.verbose else None
-    note = packing_notes(a.source, a.exe)
+    note = packing_notes(a.source, a.exe, a.bundle_libs)
     if not a.icon and os.path.isdir(a.source):
-        a.icon = find_icon(a.source)
+        a.icon = find_icon(a.source, (os.path.basename(os.path.realpath(a.source)), os.path.basename(a.exe)))
         if a.icon: print(f"Icon found in the folder: {a.icon}", file=sys.stderr)
     try:
         if a.dry_run:
-            ident, desktop, apprun = preview(a.source, name, a.exe, a.icon, a.category, a.terminal, a.version, a.comment)
+            ident, desktop, apprun = preview(a.source, name, a.exe, a.icon, a.category, a.terminal, a.version, a.comment, a.bundle_libs)
             print(f"--- {ident}.desktop ---\n{desktop}\n--- AppRun ---\n{apprun}", end="")
             if note: print(note, file=sys.stderr)
             return 0
         if a.try_first:
-            ok, text = try_run(a.source, name, a.exe, a.icon, a.category, a.terminal, a.sandbox, a.seconds, log)
+            ok, text = try_run(a.source, name, a.exe, a.icon, a.category, a.terminal, a.sandbox, a.seconds, log, None, a.bundle_libs)
             print(text)
             if note: print(note, file=sys.stderr)
             return 0 if ok else 1
-        print(build(a.source, name, a.exe, a.icon, a.category, a.terminal, os.path.abspath(a.out), None, a.sandbox, a.version, log, None, a.comment))
+        print(build(a.source, name, a.exe, a.icon, a.category, a.terminal, os.path.abspath(a.out), None, a.sandbox, a.version, log, None, a.comment, a.bundle_libs))
     except BuildError as e:
         print(e, file=sys.stderr)
         return 1
@@ -833,6 +1100,7 @@ def run_gui():
             super().__init__(application=app, title="Satchel", default_width=560, default_height=760)
             self.saved = load_settings()
             self.src, self.icon, self.exes, self.icon_auto = None, None, [], False
+            self.pkg_tmp, self.pkg_busy = None, False    # the folder an opened package is unpacked into
             self.auto_name = ""                         # the name last suggested from the program (see auto_name)
             self.last_dir = self.saved.get("last_dir")  # where the file dialogs open next
             self.out_dir = self.saved.get("out_dir", os.path.expanduser("~"))
@@ -886,7 +1154,11 @@ def run_gui():
             self.cat_row = Adw.ComboRow(title="Category", model=Gtk.StringList.new(CATEGORIES))
             if self.saved.get("category"): self.cat_row.set_selected(CATEGORIES.index(self.saved["category"]))
             self.term_row = Adw.SwitchRow(title="Runs in a terminal", active=self.saved.get("terminal", False))
-            for r in (self.name_row, self.ver_row, self.comment_row, self.icon_row, self.cat_row, self.term_row): g.add(r)
+            have_ld = bool(find_linuxdeploy())
+            self.bundle_row = Adw.SwitchRow(title="Bundle libraries (linuxdeploy)", active=False, sensitive=have_ld,
+                                            subtitle="Copies the libraries the program needs into the AppImage" if have_ld
+                                            else "linuxdeploy was not found: download it and put it in your PATH")
+            for r in (self.name_row, self.ver_row, self.comment_row, self.icon_row, self.cat_row, self.term_row, self.bundle_row): g.add(r)
             page.add(g)
 
             g = Adw.PreferencesGroup(title="Result")
@@ -914,6 +1186,7 @@ def run_gui():
             self.refresh_tool()
             drop = Gtk.DropTarget.new(Gio.File, Gdk.DragAction.COPY)       # drop a program, folder or icon on the window
             drop.connect("drop", self.dropped); self.add_controller(drop)
+            self.connect("close-request", self.closing)
             keys = Gtk.ShortcutController()
             keys.add_shortcut(Gtk.Shortcut.new(Gtk.ShortcutTrigger.parse_string("<Control>b"),
                                                Gtk.CallbackAction.new(self.shortcut_build)))
@@ -1051,7 +1324,62 @@ def run_gui():
                 self.set_source(f.get_path())
             (dlg.select_folder if folder else dlg.open)(self, None, done)
 
+        def bundling(self):
+            return self.bundle_row.get_active() and self.bundle_row.get_sensitive()
+
+        def closing(self, *_):
+            self.drop_package()
+            return False
+
+        def drop_package(self):
+            """Delete the folder an opened package was unpacked into (and forget an icon taken from it)."""
+            tmp, self.pkg_tmp = self.pkg_tmp, None
+            if not tmp: return
+            if self.icon and self.icon.startswith(tmp + os.sep):
+                self.icon, self.icon_auto = None, False; self.icon_row.set_subtitle("None: a plain placeholder is made")
+            shutil.rmtree(tmp, ignore_errors=True)
+
+        def open_package(self, path):
+            if self.pkg_busy: return
+            self.pkg_busy = True
+            self.prog_row.set_subtitle(f"Unpacking {os.path.basename(path)}…")
+            for b in (self.go, self.try_btn, self.prev_btn): b.set_sensitive(False)
+            def work():
+                tmp = tempfile.mkdtemp(prefix="satchel-pkg-")
+                try:
+                    root = f"{tmp}/root"; unpack_package(path, root)
+                    res = (tmp, package_info(root, package_hint(path)), None)
+                except BuildError as e:
+                    shutil.rmtree(tmp, ignore_errors=True); res = (None, None, str(e))
+                GLib.idle_add(self.package_ready, path, *res)
+            threading.Thread(target=work, daemon=True).start()
+
+        def package_ready(self, path, tmp, info, err):
+            self.pkg_busy = False
+            for b in (self.go, self.try_btn, self.prev_btn): b.set_sensitive(True)
+            if err:
+                self.prog_row.set_subtitle(self.src or "Nothing chosen yet")
+                return self.alert("Can't open the package", err)
+            self.drop_package(); self.pkg_tmp = tmp
+            self.src = f"{tmp}/root"
+            self.prog_row.set_subtitle(f"{os.path.basename(path)} (unpacked)")
+            self.exes = info["exes"]
+            self.exe_row.set_visible(True); self.exe_row.set_model(Gtk.StringList.new(self.exes))
+            if info["exe"] in self.exes: self.exe_row.set_selected(self.exes.index(info["exe"]))
+            else: self.alert("No program found", "That package has no program in usr/bin, usr/games or opt.")
+            new = info["name"] or package_hint(path)
+            self.name_row.set_text(auto_name(self.name_row.get_text(), self.auto_name, new)); self.auto_name = new
+            if info["comment"] and not self.comment_row.get_text(): self.comment_row.set_text(info["comment"])
+            if info["category"]: self.cat_row.set_selected(CATEGORIES.index(info["category"]))
+            if info["terminal"]: self.term_row.set_active(True)
+            if info["icon"] and (self.icon is None or self.icon_auto):
+                self.icon, self.icon_auto = info["icon"], True
+                self.icon_row.set_subtitle(os.path.relpath(info["icon"], self.src) + "  (found in the package)")
+            self.remember(path)
+
         def set_source(self, path):
+            if is_package(path): return self.open_package(path)
+            self.drop_package()
             self.src = path
             self.prog_row.set_subtitle(path)
             is_dir = os.path.isdir(path)
@@ -1062,7 +1390,7 @@ def run_gui():
             new = default_name(path)
             self.name_row.set_text(auto_name(self.name_row.get_text(), self.auto_name, new)); self.auto_name = new
             if is_dir and (self.icon is None or self.icon_auto):                # never replaces an icon you chose
-                found = find_icon(path)
+                found = find_icon(path, [os.path.basename(os.path.realpath(path)), *(os.path.basename(e) for e in self.exes[:3])])
                 if found: self.icon, self.icon_auto = found, True; self.icon_row.set_subtitle(found + "  (found in the folder)")
             self.remember(path)
 
@@ -1102,12 +1430,12 @@ def run_gui():
             self.cancel_ev = cancel = threading.Event()
             args = (self.src, self.name_row.get_text(), exe, self.icon, CATEGORIES[self.cat_row.get_selected()],
                     self.term_row.get_active(), self.out_dir, None, sandbox, self.ver_row.get_text(), self.log_line, cancel,
-                    self.comment_row.get_text())
+                    self.comment_row.get_text(), self.bundling())
             self.save()
             self.show_log(); self.try_btn.set_sensitive(False); self.prev_btn.set_sensitive(False); self.tool_group.set_sensitive(False)
             self.go.set_label("Cancel"); self.go.remove_css_class("suggested-action"); self.go.add_css_class("destructive-action")
             def work():
-                note = packing_notes(self.src, exe)
+                note = packing_notes(self.src, exe, args[-1])
                 try: res = (build(*args), None, False)
                 except Cancelled: res = (None, None, True)
                 except BuildError as e: res = (None, str(e), False)
@@ -1127,7 +1455,7 @@ def run_gui():
             exe = self.exes[self.exe_row.get_selected()] if self.exes else ""
             sandbox = self.box_row.get_active() and self.box_row.get_visible()
             args = (self.src, self.name_row.get_text(), exe, self.icon, CATEGORIES[self.cat_row.get_selected()],
-                    self.term_row.get_active(), sandbox, 5, self.log_line)
+                    self.term_row.get_active(), sandbox, 5, self.log_line, None, self.bundling())
             self.save()
             self.show_log(); self.try_btn.set_sensitive(False); self.go.set_sensitive(False); self.prev_btn.set_sensitive(False)
             self.tool_group.set_sensitive(False); self.try_btn.set_label("Trying…")
@@ -1141,7 +1469,7 @@ def run_gui():
             if not self.src: return self.alert("Nothing to preview", "Choose a program file or folder first.")
             exe = self.exes[self.exe_row.get_selected()] if self.exes else ""
             try: ident, desktop, apprun = preview(self.src, self.name_row.get_text(), exe, self.icon, CATEGORIES[self.cat_row.get_selected()],
-                                                  self.term_row.get_active(), self.ver_row.get_text(), self.comment_row.get_text())
+                                                  self.term_row.get_active(), self.ver_row.get_text(), self.comment_row.get_text(), self.bundling())
             except BuildError as e: return self.alert("Can't preview it", str(e))
             self.alert("Files that will be made", f"{ident}.desktop\n{desktop}\nAppRun\n{apprun}")
 
