@@ -134,6 +134,21 @@ class Logic(unittest.TestCase):
         self.assertIsNone(M["icon_problem"](svg)); self.assertTrue(os.path.isfile(f"{ad}/t.svg"))
         self.assertIsNotNone(M["icon_problem"](f"{self.t}/missing.png"))
 
+    def test_a_program_that_is_already_an_appimage_is_refused(self):
+        d = f"{self.t}/Pk"; os.makedirs(d); self.fake_appimage(f"{d}/spaghetti.appimage"); put(f"{d}/data.txt", "x")
+        single, ad = f"{self.t}/one.appimage", f"{self.t}/AD"; self.fake_appimage(single)
+        for src, exe in ((d, "spaghetti.appimage"), (single, "")):
+            for call in (lambda: M["make_appdir"](src, "x", exe, None, "Utility", False, ad), lambda: M["preview"](src, "x", exe, None, "Utility", False),
+                         lambda: M["try_run"](src, "x", exe, None, "Utility", False)):
+                with self.assertRaisesRegex(BuildError, "already an AppImage"): call()
+        self.assertFalse(os.path.exists(f"{ad}/AppRun"))
+        out = io.StringIO()
+        with contextlib.redirect_stderr(out): self.assertEqual(M["main"]([single, "--dry-run"]), 1)
+        self.assertIn("already an AppImage", out.getvalue())
+        self.assertEqual(M["nested_problem"](script(f"{self.t}/plain", "echo\n")), "")       # an ordinary program is fine
+        self.assertEqual(M["nested_problem"](f"{self.t}/missing"), "")
+        script(f"{d}/run", "echo hi\n"); M["preview"](d, "x", "run", None, "Utility", False)   # a folder that merely holds one is fine
+
     def test_find_executables_skips_libs_and_data(self):
         self.assertEqual(M["find_executables"](self.prog_folder()), ["bin/run"])
 
@@ -924,6 +939,15 @@ class Window(unittest.TestCase):
         self.w.set_source(b); self.assertEqual(self.w.name_row.get_text(), "beta")           # not stuck on the first one
         self.w.name_row.set_text("My Editor"); self.w.set_source(c); self.assertEqual(self.w.name_row.get_text(), "My Editor")
         self.assertEqual(self.w.exes, ["run"]); self.assertEqual(self.w.last_dir, self.t)    # dialogs open here next time
+
+    def test_the_program_matching_the_folder_name_is_chosen_to_start(self):
+        d = self.folder("alpha", "ajail"); script(f"{d}/alpha", "echo hi\n")                # "ajail" sorts first, "alpha" is the app
+        self.w.set_source(d)
+        self.assertEqual(self.w.exes, ["ajail", "alpha"]); self.assertEqual(self.w.exe_row.get_selected(), 1)
+        d2 = self.folder("beta", "aaa"); script(f"{d2}/zzz", "")                              # nothing matches: the first one
+        self.w.set_source(d2); self.assertEqual(self.w.exe_row.get_selected(), 0)
+        self.assertEqual(M["best_exe"](["bin/x", "bin/foo-cli", "foo"], ["foo"]), 2)        # exact name beats a prefix
+        self.assertEqual(M["best_exe"](["a", "foo-bin"], ["foo"]), 1); self.assertEqual(M["best_exe"]([], ["x"]), 0)
 
     def test_empty_name_is_marked_and_cleared(self):
         self.w.name_row.set_text(""); self.w.name_changed(); self.assertIn("error", self.w.name_row.css)

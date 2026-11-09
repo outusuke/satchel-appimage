@@ -1,6 +1,6 @@
 # satchel
 
-A small GTK4 + libadwaita front end for `appimagetool`: pick a program (a file, a folder or a `.deb` package), name it, pick an icon,
+A small GTK4 + libadwaita front end for `appimagetool`: pick a program (a file, a folder, a `.deb` package, or an archive), name it, pick an icon,
 build an `.AppImage`. It packs exactly what you give it. It does **not** copy in shared libraries unless you switch on **Bundle libraries**, so the result
 runs only where those libraries exist (the program warns you about libraries it can see are missing).
 
@@ -30,7 +30,9 @@ into the package. For a plain archive the program and icon are found inside it l
     satchel PROGRAM [--name N] [--exe E] [--icon I] [--category C] [--version V] [--comment T]
                          [--terminal] [--bundle-libs] [--out DIR] [--sandbox] [--try [--seconds S]] [--dry-run] [-v]
 
-If you give a folder and no icon, the most likely one inside it is used (it follows the `Icon=` line of a `.desktop` file there, then the file and folder names, then the size).
+If you give a folder and no icon, the most likely one inside it is used (it follows the `Icon=` line of a `.desktop` file there, then the file and folder names, then the size). In the window, when a folder holds several programs, the one named like the folder is chosen to start first.
+
+A program, or a folder it sits in, that is a symbolic link leading outside the packed folder is refused, since the link would not be packed.
 
 `--dry-run` prints the files that would be made and builds nothing. `--try` only starts the program to see that it works.
 

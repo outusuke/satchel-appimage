@@ -156,6 +156,15 @@ def packing_notes(src, exe, bundle=False):
     return "\n\n".join(n for n in notes if n)
 
 
+def nested_problem(path):
+    """Why a program that is itself an AppImage is refused, or ''. Inside another AppImage it needs FUSE to start, and a system
+    that hands AppImages to a launcher or sandbox (binfmt_misc, ajail, AppImageLauncher) starts that instead of the program."""
+    if not os.path.isfile(path) or appimage_offset(path) is None: return ""
+    return (f"'{os.path.basename(path)}' is already an AppImage, so it is not packed inside another one: it would need FUSE to "
+            "start, and a system that passes AppImages to a launcher or sandbox (binfmt_misc, ajail, AppImageLauncher) would "
+            "start that instead. Use the file as it is, or unpack it and pack what is inside.")
+
+
 def icon_problem(path):
     """Why path cannot be used as an icon, or None. The file must really be a PNG or an SVG, whatever its name says."""
     ext = os.path.splitext(path)[1].lower()
@@ -251,6 +260,18 @@ def find_executables(folder):
             if os.path.isfile(p) and os.access(p, os.X_OK) and not (f.endswith(".so") or ".so." in f):
                 out.append(os.path.relpath(p, base))
     return sorted(out, key=lambda r: (r.count(os.sep), r))
+
+
+def best_exe(exes, hints):
+    """The index in exes of the program most likely meant: one named like a hint (the folder or app name) beats one whose
+    name starts with a hint; otherwise the first. exes is the list from find_executables (shallowest first)."""
+    want = [h.lower() for h in hints if h]
+    best, score = 0, 0
+    for i, e in enumerate(exes):
+        stem = os.path.splitext(os.path.basename(e))[0].lower()
+        s = 2 if stem in want else 1 if any(stem.startswith(h) for h in want) else 0
+        if s > score: best, score = i, s
+    return best
 
 
 def _is_lib(name):
@@ -714,6 +735,8 @@ def check_inputs(src, name, exe, icon, category, version="", comment=""):
         exe = os.path.basename(src)
     else:
         raise BuildError("Choose the program file or folder to pack.")
+    why = nested_problem(os.path.join(src, exe) if os.path.isdir(src) else src)
+    if why: raise BuildError(why)
     if icon:
         ext = os.path.splitext(icon)[1].lower()
         if icon_problem(icon): raise BuildError(icon_problem(icon))
@@ -1516,6 +1539,7 @@ def run_gui():
             self.exes = find_executables(path) if is_dir else []
             self.exe_row.set_visible(is_dir)
             self.exe_row.set_model(Gtk.StringList.new(self.exes))
+            if self.exes: self.exe_row.set_selected(best_exe(self.exes, [default_name(path), os.path.basename(os.path.realpath(path))]))
             if is_dir and not self.exes: self.alert("No program found", "That folder has no executable file in it (two levels deep).")
             new = default_name(path)
             self.name_row.set_text(auto_name(self.name_row.get_text(), self.auto_name, new)); self.auto_name = new
