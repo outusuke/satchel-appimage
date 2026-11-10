@@ -4,12 +4,13 @@ def bundle_libraries(appdir, ident, exe, log=None, cancel=None, bwrap=None):
     tool = find_linuxdeploy()
     if not tool: raise BuildError(f"Bundling libraries needs linuxdeploy, which was not found. Download it from "
                                   f"{LINUXDEPLOY_URL}, make it executable and put it in your PATH.")
+    prog_tool, share = prepare_tool(tool)       # an AppImage linuxdeploy is unpacked and run as a plain program (see prepare_tool)
     if log: log("Copying libraries in (linuxdeploy)…")
     prog = f"{appdir}/usr/lib/{ident}/{os.path.normpath(exe)}"
-    cmd, env, work = [tool, "--appdir", appdir, "--executable", prog], {**os.environ, "APPIMAGE_EXTRACT_AND_RUN": "1"}, os.path.dirname(appdir)
+    cmd, env, work = [prog_tool, "--appdir", appdir, "--executable", prog], {**os.environ, "APPIMAGE_EXTRACT_AND_RUN": "1"}, os.path.dirname(appdir)
     if bwrap:
-        base = bwrap_base(bwrap, (tool,), work, platform.machine(), os.path.realpath(os.path.expanduser("~")), False)
-        cmd = base[:-3] + ["--setenv", "APPIMAGE_EXTRACT_AND_RUN", "1"] + base[-3:] + [os.path.realpath(tool), *cmd[1:]]
+        base = bwrap_base(bwrap, (share or tool,), work, platform.machine(), os.path.realpath(os.path.expanduser("~")), False)
+        cmd = base[:-3] + ["--setenv", "APPIMAGE_EXTRACT_AND_RUN", "1"] + base[-3:] + cmd
     code, text, _ = run_streaming(cmd, env, work, log, cancel, 600, own_group=not bwrap)
     if code != 0: raise BuildError("linuxdeploy failed:\n" + text.strip()[-900:])
 

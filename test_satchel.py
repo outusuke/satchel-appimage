@@ -812,7 +812,7 @@ class Logic(unittest.TestCase):
         finally: M["run_streaming"] = old_run; os.environ["PATH"] = old_path
         cmd = seen[0]
         self.assertEqual(cmd[0], "/usr/bin/bwrap"); self.assertNotIn("--share-net", cmd); self.assertIn("--unshare-all", cmd)
-        self.assertIn("APPIMAGE_EXTRACT_AND_RUN", cmd); self.assertEqual(cmd[cmd.index("--") + 1:][0], os.path.realpath(tool))
+        self.assertIn("APPIMAGE_EXTRACT_AND_RUN", cmd); self.assertEqual(cmd[cmd.index("--") + 1:][0], os.path.realpath(tool))   # a plain program is run as it is
         self.assertIn(f"{self.t}/work", cmd)                                               # the folder holding the AppDir is writable
 
     def make_tar(self, path, files, mode="w:xz"):
