@@ -9,10 +9,17 @@
 #                             [--bundle-libs] [--out DIR] [--sandbox] [--try [--seconds S]] [--dry-run] [-v]
 import collections, glob, hashlib, json, os, platform, re, shlex, shutil, signal, stat, struct, subprocess, sys, tarfile, tempfile, threading, time, unicodedata, zipfile, zlib
 
+
 CATEGORIES = ["Utility", "Development", "Graphics", "Network", "AudioVideo", "Office", "Game", "Education",
               "Science", "System", "Settings"]
+
+
 ICON_EXT = (".png", ".svg")
+
+
 TOOL_URL = "https://github.com/AppImage/appimagetool/releases"
+
+
 APP_VERSION = "1.1"
 
 
@@ -25,7 +32,6 @@ class Cancelled(BuildError):
 
 
 OS_RELEASE = "/etc/os-release"
-SETTINGS = os.path.expanduser("~/.config/satchel/settings.json")
 
 
 def install_hint(pkg):
@@ -42,31 +48,6 @@ def install_hint(pkg):
         if i in ("arch", "manjaro"): return f"sudo pacman -S {pkg}"
         if i in ("suse", "sles") or i.startswith("opensuse"): return f"sudo zypper install {pkg}"
     return f"sudo dnf install {pkg}"
-
-
-def load_settings(path=None):
-    """The choices saved from the last run. Each value is checked; anything missing or wrong is left out."""
-    try:
-        with open(path or SETTINGS) as f: raw = json.load(f)
-    except (OSError, ValueError): return {}
-    if not isinstance(raw, dict): return {}
-    out = {}
-    if isinstance(raw.get("out_dir"), str) and os.path.isdir(raw["out_dir"]): out["out_dir"] = raw["out_dir"]
-    if isinstance(raw.get("last_dir"), str) and os.path.isdir(raw["last_dir"]): out["last_dir"] = raw["last_dir"]
-    if raw.get("category") in CATEGORIES: out["category"] = raw["category"]
-    for k in ("terminal", "sandbox"):
-        if isinstance(raw.get(k), bool): out[k] = raw[k]
-    return out
-
-
-def save_settings(data, path=None):
-    """Remember the choices. This is a convenience, so a failure to write is ignored and never stops a build."""
-    path = path or SETTINGS
-    try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path + ".new", "w") as f: json.dump(data, f, indent=1)
-        os.replace(path + ".new", path)
-    except OSError: pass
 
 
 def clean(n):
@@ -109,14 +90,6 @@ def folder_size(folder, limit=None):
     return total
 
 
-def size_note(src):
-    """A warning when the program folder is very big, or ''. The folder is copied once into the app folder and again into the image."""
-    if os.path.isdir(src) and folder_size(src, BIG_FOLDER) > BIG_FOLDER:
-        return ("Heads up: the program folder is over 1 GB. Building copies it twice, so it needs plenty of free disk space "
-                "and takes a while, and the AppImage will be big.")
-    return ""
-
-
 def outside_link(path, base):
     """True when path is a symbolic link that would not work once the folder is packed: an absolute link, or one that
     leads out of base (a folder, already resolved)."""
@@ -137,25 +110,6 @@ def outside_links(folder):
     return sorted(out)
 
 
-def links_note(links):
-    """A warning about links that were left out of the AppImage, or '' when there are none."""
-    if not links: return ""
-    shown = ", ".join(links[:8]) + (f" and {len(links) - 8} more" if len(links) > 8 else "")
-    return ("Heads up: these symbolic links point outside the program folder (or use an absolute path), so they were "
-            "left out of the AppImage: " + shown + ". If the program needs them, copy the real files into the folder.")
-
-
-def packing_notes(src, exe, bundle=False):
-    """All the warnings for the result message (wrong kind of computer, missing libraries, links left out, very big
-    folder), joined;
-    '' when there are none."""
-    prog = os.path.join(src, exe) if os.path.isdir(src) else src
-    links = outside_links(src) if os.path.isdir(src) else []
-    notes = (arch_problem(prog) if os.path.isfile(prog) else "", ("" if bundle else missing_note(missing_libraries(src, exe))), links_note(links),
-             size_note(src))
-    return "\n\n".join(n for n in notes if n)
-
-
 def nested_problem(path):
     """Why a program that is itself an AppImage is refused, or ''. Inside another AppImage it needs FUSE to start, and a system
     that hands AppImages to a launcher or sandbox (binfmt_misc, ajail, AppImageLauncher) starts that instead of the program."""
@@ -163,89 +117,6 @@ def nested_problem(path):
     return (f"'{os.path.basename(path)}' is already an AppImage, so it is not packed inside another one: it would need FUSE to "
             "start, and a system that passes AppImages to a launcher or sandbox (binfmt_misc, ajail, AppImageLauncher) would "
             "start that instead. Use the file as it is, or unpack it and pack what is inside.")
-
-
-def icon_problem(path):
-    """Why path cannot be used as an icon, or None. The file must really be a PNG or an SVG, whatever its name says."""
-    ext = os.path.splitext(path)[1].lower()
-    if ext not in ICON_EXT or not os.path.isfile(path): return "The icon must be an existing .png or .svg file."
-    try:
-        with open(path, "rb") as f: head = f.read(4096)
-    except OSError as e: return f"Could not read the icon: {e}"
-    if ext == ".png" and head[:4] != b"\x89PNG": return "That file is named .png but is not a PNG image."
-    if ext == ".svg" and b"<svg" not in head.lower(): return "That file is named .svg but is not an SVG image."
-    return None
-
-
-def png_size(path):
-    """(width, height) read from a PNG header, or None."""
-    try:
-        with open(path, "rb") as f: head = f.read(24)
-    except OSError: return None
-    if head[:8] != b"\x89PNG\r\n\x1a\n" or head[12:16] != b"IHDR": return None
-    return struct.unpack(">II", head[16:24])
-
-
-GOOD_ICON_WORDS = ("icon", "logo", "default", "appicon")
-BAD_ICON_WORDS = ("splash", "banner", "background", "screenshot", "wallpaper", "header", "thumb", "preview", "symbolic",
-                  "sprite", "cursor", "tray", "mask")
-GOOD_ICON_DIRS = ("icons", "icon", "hicolor", "pixmaps", "apps")
-BAD_ICON_DIRS = ("images", "img", "doc", "docs", "help", "screenshots", "samples", "examples", "test", "tests")
-
-
-def desktop_icon_names(folder, depth=4):
-    """The Icon= values of the .desktop files inside folder (name or absolute path as written)."""
-    base, out = os.path.realpath(folder), []
-    for root, dirs, files in os.walk(base):
-        if root[len(base):].count(os.sep) >= depth: dirs[:] = []
-        for fn in files:
-            if not fn.endswith(".desktop"): continue
-            try:
-                with open(os.path.join(root, fn), encoding="utf-8", errors="replace") as f: text = f.read(20000)
-            except OSError: continue
-            m = re.search(r"^Icon\s*=\s*(.+?)\s*$", text, re.M)
-            if m: out.append(m.group(1))
-    return out
-
-
-def find_icon(folder, hints=(), min_px=48, depth=4, limit=3000, extra_names=()):
-    """The most likely icon inside a program folder, or None. Every real .png/.svg (checked by content; a .png is at
-    least min_px) is scored by clues: an Icon= line in a .desktop file in the folder is the strongest; a file name
-    that matches the program (hints) or says icon/logo is good; splash, banner, screenshot and similar names are bad;
-    an icons/ folder is good, images/ or docs/ is bad; a square image is better. Ties go to the larger image, and
-    an .svg counts as the largest. Looks at most depth folders down and at most limit files."""
-    base, cands, seen = os.path.realpath(folder), [], 0
-    if not os.path.isdir(base): return None
-    named = [*desktop_icon_names(base, depth), *extra_names]
-    names = {os.path.splitext(os.path.basename(n))[0].lower() for n in named}
-    paths = {os.path.realpath(n) for n in named if os.path.isabs(n)}
-    hint_stems = {os.path.splitext(os.path.basename(h))[0].lower() for h in hints if h}
-    for root, dirs, files in os.walk(base):
-        parts = [x.lower() for x in root[len(base):].split(os.sep) if x]
-        if len(parts) >= depth: dirs[:] = []
-        dirs.sort()
-        for fn in sorted(files):
-            seen += 1
-            if seen > limit: break
-            path, (stem, ext) = os.path.join(root, fn), os.path.splitext(fn)
-            low = stem.lower()
-            if ext.lower() not in ICON_EXT or os.path.islink(path) or icon_problem(path): continue
-            if ext.lower() == ".svg": size, square = 4096, True
-            else:
-                wh = png_size(path)
-                if not wh or min(wh) < min_px: continue
-                size, square = min(wh), wh[0] == wh[1]
-            score = 0
-            if os.path.realpath(path) in paths or low in names: score += 100
-            if low in hint_stems or any(h and low.startswith(h) for h in hint_stems): score += 50
-            if any(w in low for w in GOOD_ICON_WORDS): score += 20
-            if any(w in low for w in BAD_ICON_WORDS): score -= 60
-            if any(d in GOOD_ICON_DIRS for d in parts): score += 15
-            if any(d in BAD_ICON_DIRS for d in parts): score -= 15
-            if square: score += 10
-            cands.append((score, size, -len(parts), path))
-        if seen > limit: break
-    return max(cands)[3] if cands else None
 
 
 def find_executables(folder):
@@ -288,6 +159,22 @@ def library_dirs(folder, max_depth=3):
         if depth >= max_depth: dirs[:] = []
         if ":" not in rel and any(_is_lib(f) for f in files): out.append((depth, rel))
     return [rel for _, rel in sorted(out)[:30]]
+
+
+def appimage_offset(path):
+    """Where the squashfs image starts inside a type 2 AppImage (right after its ELF section headers), or None if it isn't one."""
+    try:
+        with open(path, "rb") as f:
+            h = f.read(64)
+            if len(h) < 64 or h[:4] != b"\x7fELF" or h[8:11] != b"AI\x02": return None
+            e = "<" if h[5] == 1 else ">"
+            if h[4] == 2: shoff, = struct.unpack_from(e + "Q", h, 0x28); sz, num = struct.unpack_from(e + "HH", h, 0x3A)
+            else: shoff, = struct.unpack_from(e + "I", h, 0x20); sz, num = struct.unpack_from(e + "HH", h, 0x2E)
+            off = shoff + sz * num
+            f.seek(off)
+            return off if f.read(4) in (b"hsqs", b"sqsh") else None
+    except (OSError, struct.error):
+        return None
 
 
 def elf_dynamic(path):
@@ -341,6 +228,8 @@ def needed_libs(path):
 
 MACHINES = {"x86_64": 62, "amd64": 62, "aarch64": 183, "arm64": 183, "i386": 3, "i486": 3, "i586": 3, "i686": 3,
             "armv7l": 40, "armv8l": 40, "riscv64": 243, "ppc64le": 21, "ppc64": 21, "s390x": 22, "loongarch64": 258}
+
+
 MACHINE_NAMES = {62: "x86_64", 183: "aarch64", 3: "i686", 40: "arm", 243: "riscv64", 21: "ppc64", 22: "s390x", 258: "loongarch64"}
 
 
@@ -410,6 +299,122 @@ def missing_libraries(src, exe):
     return sorted(wanted - system_libraries()) if wanted else []
 
 
+def icon_problem(path):
+    """Why path cannot be used as an icon, or None. The file must really be a PNG or an SVG, whatever its name says."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in ICON_EXT or not os.path.isfile(path): return "The icon must be an existing .png or .svg file."
+    try:
+        with open(path, "rb") as f: head = f.read(4096)
+    except OSError as e: return f"Could not read the icon: {e}"
+    if ext == ".png" and head[:4] != b"\x89PNG": return "That file is named .png but is not a PNG image."
+    if ext == ".svg" and b"<svg" not in head.lower(): return "That file is named .svg but is not an SVG image."
+    return None
+
+
+def png_size(path):
+    """(width, height) read from a PNG header, or None."""
+    try:
+        with open(path, "rb") as f: head = f.read(24)
+    except OSError: return None
+    if head[:8] != b"\x89PNG\r\n\x1a\n" or head[12:16] != b"IHDR": return None
+    return struct.unpack(">II", head[16:24])
+
+
+GOOD_ICON_WORDS = ("icon", "logo", "default", "appicon")
+
+
+BAD_ICON_WORDS = ("splash", "banner", "background", "screenshot", "wallpaper", "header", "thumb", "preview", "symbolic",
+                  "sprite", "cursor", "tray", "mask")
+
+
+GOOD_ICON_DIRS = ("icons", "icon", "hicolor", "pixmaps", "apps")
+
+
+BAD_ICON_DIRS = ("images", "img", "doc", "docs", "help", "screenshots", "samples", "examples", "test", "tests")
+
+
+def desktop_icon_names(folder, depth=4):
+    """The Icon= values of the .desktop files inside folder (name or absolute path as written)."""
+    base, out = os.path.realpath(folder), []
+    for root, dirs, files in os.walk(base):
+        if root[len(base):].count(os.sep) >= depth: dirs[:] = []
+        for fn in files:
+            if not fn.endswith(".desktop"): continue
+            try:
+                with open(os.path.join(root, fn), encoding="utf-8", errors="replace") as f: text = f.read(20000)
+            except OSError: continue
+            m = re.search(r"^Icon\s*=\s*(.+?)\s*$", text, re.M)
+            if m: out.append(m.group(1))
+    return out
+
+
+def find_icon(folder, hints=(), min_px=48, depth=4, limit=3000, extra_names=()):
+    """The most likely icon inside a program folder, or None. Every real .png/.svg (checked by content; a .png is at
+    least min_px) is scored by clues: an Icon= line in a .desktop file in the folder is the strongest; a file name
+    that matches the program (hints) or says icon/logo is good; splash, banner, screenshot and similar names are bad;
+    an icons/ folder is good, images/ or docs/ is bad; a square image is better. Ties go to the larger image, and
+    an .svg counts as the largest. Looks at most depth folders down and at most limit files."""
+    base, cands, seen = os.path.realpath(folder), [], 0
+    if not os.path.isdir(base): return None
+    named = [*desktop_icon_names(base, depth), *extra_names]
+    names = {os.path.splitext(os.path.basename(n))[0].lower() for n in named}
+    paths = {os.path.realpath(n) for n in named if os.path.isabs(n)}
+    hint_stems = {os.path.splitext(os.path.basename(h))[0].lower() for h in hints if h}
+    for root, dirs, files in os.walk(base):
+        parts = [x.lower() for x in root[len(base):].split(os.sep) if x]
+        if len(parts) >= depth: dirs[:] = []
+        dirs.sort()
+        for fn in sorted(files):
+            seen += 1
+            if seen > limit: break
+            path, (stem, ext) = os.path.join(root, fn), os.path.splitext(fn)
+            low = stem.lower()
+            if ext.lower() not in ICON_EXT or os.path.islink(path) or icon_problem(path): continue
+            if ext.lower() == ".svg": size, square = 4096, True
+            else:
+                wh = png_size(path)
+                if not wh or min(wh) < min_px: continue
+                size, square = min(wh), wh[0] == wh[1]
+            score = 0
+            if os.path.realpath(path) in paths or low in names: score += 100
+            if low in hint_stems or any(h and low.startswith(h) for h in hint_stems): score += 50
+            if any(w in low for w in GOOD_ICON_WORDS): score += 20
+            if any(w in low for w in BAD_ICON_WORDS): score -= 60
+            if any(d in GOOD_ICON_DIRS for d in parts): score += 15
+            if any(d in BAD_ICON_DIRS for d in parts): score -= 15
+            if square: score += 10
+            cands.append((score, size, -len(parts), path))
+        if seen > limit: break
+    return max(cands)[3] if cands else None
+
+
+def size_note(src):
+    """A warning when the program folder is very big, or ''. The folder is copied once into the app folder and again into the image."""
+    if os.path.isdir(src) and folder_size(src, BIG_FOLDER) > BIG_FOLDER:
+        return ("Heads up: the program folder is over 1 GB. Building copies it twice, so it needs plenty of free disk space "
+                "and takes a while, and the AppImage will be big.")
+    return ""
+
+
+def links_note(links):
+    """A warning about links that were left out of the AppImage, or '' when there are none."""
+    if not links: return ""
+    shown = ", ".join(links[:8]) + (f" and {len(links) - 8} more" if len(links) > 8 else "")
+    return ("Heads up: these symbolic links point outside the program folder (or use an absolute path), so they were "
+            "left out of the AppImage: " + shown + ". If the program needs them, copy the real files into the folder.")
+
+
+def packing_notes(src, exe, bundle=False):
+    """All the warnings for the result message (wrong kind of computer, missing libraries, links left out, very big
+    folder), joined;
+    '' when there are none."""
+    prog = os.path.join(src, exe) if os.path.isdir(src) else src
+    links = outside_links(src) if os.path.isdir(src) else []
+    notes = (arch_problem(prog) if os.path.isfile(prog) else "", ("" if bundle else missing_note(missing_libraries(src, exe))), links_note(links),
+             size_note(src))
+    return "\n\n".join(n for n in notes if n)
+
+
 def missing_note(missing):
     """A warning for the result message, or '' when nothing is missing."""
     if not missing: return ""
@@ -420,8 +425,14 @@ def missing_note(missing):
 
 # ---- packages (.deb): unpacked into a folder, then handled like any program folder ----
 ARCHIVE_EXT = (".tar.gz", ".tgz", ".tar.xz", ".txz", ".tar.bz2", ".tbz2", ".tar.zst", ".tzst", ".zip")
+
+
 PKG_EXT = (".deb",) + ARCHIVE_EXT                  # a .pkg.tar.zst (Arch) is an archive that also holds a usr/ tree
+
+
 MAX_UNPACKED = 8 << 30
+
+
 CATEGORY_MAP = {"Utility": "Utility", "TextEditor": "Utility", "Development": "Development", "IDE": "Development",
                 "Graphics": "Graphics", "Network": "Network", "WebBrowser": "Network", "Email": "Network",
                 "AudioVideo": "AudioVideo", "Audio": "AudioVideo", "Video": "AudioVideo", "Player": "AudioVideo",
@@ -656,8 +667,118 @@ def package_info(root, hint=""):
             "category": category, "terminal": entry.get("Terminal", "").lower() == "true", "icon": icon}
 
 
+def need_bwrap():
+    """The bubblewrap program, or a BuildError that says how to install it."""
+    bwrap = shutil.which("bwrap")
+    if not bwrap: raise BuildError(f"The sandbox is switched on but bubblewrap (bwrap) was not found: {install_hint('bubblewrap')}")
+    return bwrap
+
+
+def display_args(env):
+    """(bubblewrap arguments, environment pairs) that let a program in the sandbox use your screen: the Wayland socket
+    and/or the X11 socket with its login file, plus /dev/dri for graphics. Nothing else of your session is shown, and
+    the network stays off. With no screen in env this adds nothing."""
+    a, e = [], []
+    run = env.get("XDG_RUNTIME_DIR", "")
+    wl = env.get("WAYLAND_DISPLAY", "")
+    if run and wl:
+        sock = wl if os.path.isabs(wl) else os.path.join(run, wl)
+        if os.path.exists(sock):
+            a += ["--ro-bind", sock, f"/run/satchel-display/{os.path.basename(sock)}"]
+            e += [("XDG_RUNTIME_DIR", "/run/satchel-display"), ("WAYLAND_DISPLAY", os.path.basename(sock))]
+    disp = env.get("DISPLAY", "")
+    if disp and os.path.isdir("/tmp/.X11-unix"):
+        a += ["--ro-bind", "/tmp/.X11-unix", "/tmp/.X11-unix"]
+        e.append(("DISPLAY", disp))
+        xa = env.get("XAUTHORITY") or os.path.expanduser("~/.Xauthority")
+        if os.path.isfile(xa):
+            a += ["--ro-bind", os.path.realpath(xa), "/run/satchel-display/Xauthority"]
+            e.append(("XAUTHORITY", "/run/satchel-display/Xauthority"))
+    if e: a += ["--dev-bind-try", "/dev/dri", "/dev/dri"]
+    return a, e
+
+
+def bwrap_base(bwrap, show, work, arch, home, net, version="", display=False):
+    """The bubblewrap part of a command, ending in '--': the system is read-only, your real home and other users are
+    hidden, /tmp is fresh, and only the work folder is writable. Network only if net (it is needed to download the
+    runtime when you have not set one). Files in show that lie inside your home are shown read-only. No system-call
+    filter: this is a convenience sandbox, not a security boundary. With display, the screen is let through (see
+    display_args) so a window program can open its window; the network stays off."""
+    parent = os.path.dirname(home)
+    a = [bwrap, "--unshare-all", *(["--share-net"] if net else []), "--die-with-parent", "--new-session", "--clearenv",
+         "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--tmpfs", "/run"]
+    if net: a += [x for d in ("/run/systemd/resolve", "/run/NetworkManager") for x in ("--ro-bind-try", d, d)]   # DNS
+    a += ["--tmpfs", parent] if parent != "/" else []
+    a += ["--tmpfs", home]
+    for d in ("/root", "/mnt", "/media", "/srv"):
+        if os.path.isdir(d) and not os.path.islink(d) and home != d and not home.startswith(d + "/"): a += ["--tmpfs", d]
+    for q in dict.fromkeys(os.path.realpath(x) for x in show if x):
+        if q.startswith(home + "/"): a += ["--ro-bind", q, q]
+    a += ["--bind", work, work]
+    envs = []
+    if display:
+        more, envs = display_args(os.environ)
+        a += more
+    for k, v in (*envs, ("HOME", home), ("PATH", "/usr/local/bin:/usr/bin:/usr/sbin"), ("LANG", "C.UTF-8"), ("ARCH", arch),
+                 *((("VERSION", version),) if version else ())):
+        a += ["--setenv", k, v]
+    return a + ["--chdir", work, "--"]
+
+
+def bwrap_cmd(bwrap, exe, share, runtime, appdir, out, work, arch, home, net, version=""):
+    """appimagetool inside bubblewrap (see bwrap_base). A tool or runtime file inside your home is shown read-only."""
+    return (bwrap_base(bwrap, (share or exe, runtime), work, arch, home, net, version)
+            + [exe, *(["--runtime-file", runtime] if runtime else []), appdir, out])
+
+
+def run_streaming(cmd, env, cwd, log=None, cancel=None, timeout=600, timeout_is_error=True, own_group=True):
+    """Run cmd and hand each line of its output (errors included) to log as it appears. The program is stopped when
+    cancel is set (raises Cancelled), on Ctrl-C, or after timeout seconds (raises BuildError, or just returns when
+    timeout_is_error is False). With own_group it runs in a process group of its own and the whole group is stopped;
+    without it only cmd itself is stopped (bubblewrap cannot be a group leader because it starts its own session, and it
+    takes everything inside it down with it). Returns (exit code or None, the last lines of output, timed out)."""
+    if log: log("$ " + shlex.join(cmd))
+    try: p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace", env=env,
+                              cwd=cwd, stdin=subprocess.DEVNULL, start_new_session=own_group)
+    except OSError as e: raise BuildError(f"Could not start {os.path.basename(cmd[0])}: {e}")
+    tail = collections.deque(maxlen=200)
+
+    def pump():
+        for line in p.stdout:
+            line = line.rstrip("\n"); tail.append(line)
+            if log: log(line)
+    reader = threading.Thread(target=pump, daemon=True); reader.start()
+
+    def stop():
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try: os.killpg(p.pid, sig) if own_group else p.send_signal(sig)
+            except OSError: break
+            try: p.wait(timeout=3); break
+            except subprocess.TimeoutExpired: pass
+    why, deadline = None, time.monotonic() + timeout
+    try:
+        while True:
+            try: p.wait(timeout=0.1); break
+            except subprocess.TimeoutExpired: pass
+            if cancel is not None and cancel.is_set(): why = "cancel"
+            elif time.monotonic() > deadline: why = "timeout"
+            if why: stop(); break
+    except BaseException:
+        stop(); raise
+    reader.join(timeout=5)
+    if not reader.is_alive(): p.stdout.close()
+    text = "\n".join(tail)
+    if why == "cancel": raise Cancelled("Cancelled.")
+    if why == "timeout" and timeout_is_error: raise BuildError(f"It ran for more than {timeout:g} seconds, so it was stopped.")
+    return (None if why else p.returncode), text, why == "timeout"
+
+
 LINUXDEPLOY_URL = "https://github.com/linuxdeploy/linuxdeploy/releases"
+
+
 LD_DL = "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-{arch}.AppImage"
+
+
 LD_HOME = os.path.expanduser("~/.local/bin/linuxdeploy")
 
 
@@ -685,6 +806,158 @@ def download_linuxdeploy(dest=None, opener=None):
         download(LD_DL.format(arch=platform.machine()), f"{d}/l", opener)
         if appimage_offset(f"{d}/l") is None: raise BuildError("What was downloaded is not an AppImage, so it was not installed.")
         return install_tool(f"{d}/l", dest or LD_HOME)
+
+
+RUNTIME_URL = "https://github.com/AppImage/type2-runtime/releases"
+
+
+TOOL_DL = "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-{arch}.AppImage"
+
+
+RUNTIME_DL = "https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-{arch}"
+
+
+MAX_DOWNLOAD = 200 * 1024 * 1024
+
+
+RUNTIME_DIR = os.path.expanduser("~/.local/share/satchel")
+
+
+TOOL_HOME = os.path.expanduser("~/.local/bin/appimagetool")
+
+
+def find_tool():
+    return os.environ.get("APPIMAGETOOL") or shutil.which("appimagetool") or next(
+        (p for p in (TOOL_HOME, os.path.expanduser("~/bin/appimagetool")) if os.access(p, os.X_OK)), None)
+
+
+def find_download():
+    """An appimagetool file you already downloaded into ~/Downloads (newest first), or None."""
+    d = os.path.expanduser("~/Downloads")
+    try: names = [f for f in os.listdir(d) if f.lower().startswith("appimagetool")]
+    except OSError: return None
+    files = [f"{d}/{n}" for n in names if os.path.isfile(f"{d}/{n}")]
+    files.sort(key=lambda p: (platform.machine() not in os.path.basename(p), -os.path.getmtime(p)))
+    return files[0] if files else None
+
+
+def install_tool(src, dest=TOOL_HOME):
+    """Copy a file you downloaded to ~/.local/bin/appimagetool and make it executable. Refuses anything that isn't a program."""
+    try:
+        with open(src, "rb") as f: magic = f.read(4)
+    except OSError as e: raise BuildError(f"Could not read that file: {e}")
+    if magic != b"\x7fELF": raise BuildError("That is not a program file (an AppImage starts with ELF). Did the download save a web page?")
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    tmp = dest + ".new"
+    shutil.copyfile(src, tmp); os.chmod(tmp, 0o755); os.replace(tmp, dest)
+    return dest
+
+
+def download(url, dest, opener=None):
+    """Fetch an https address into the file dest (at most MAX_DOWNLOAD bytes). Raises BuildError; leaves no partial file."""
+    import urllib.request
+    opener = opener or urllib.request.urlopen
+    if not url.startswith("https://"): raise BuildError("Only https downloads are allowed.")
+    try:
+        with opener(urllib.request.Request(url, headers={"User-Agent": "satchel"}), timeout=30) as r, open(dest, "wb") as f:
+            if not r.geturl().startswith("https://"): raise BuildError("The download was redirected to an address that is not https.")
+            total = 0
+            while True:
+                chunk = r.read(65536)
+                if not chunk: break
+                total += len(chunk)
+                if total > MAX_DOWNLOAD: raise BuildError("The download is larger than expected, so it was stopped.")
+                f.write(chunk)
+    except BuildError:
+        if os.path.exists(dest): os.unlink(dest)
+        raise
+    except OSError as e:
+        if os.path.exists(dest): os.unlink(dest)
+        raise BuildError(f"Could not download {url}\n{e}\nUse 'Use a downloaded file…' instead.")
+
+
+def download_tool(dest=None, opener=None):
+    """Download appimagetool for this machine and install it. Returns where it went."""
+    with tempfile.TemporaryDirectory(prefix="satchel-dl-") as d:
+        download(TOOL_DL.format(arch=platform.machine()), f"{d}/t", opener)
+        if appimage_offset(f"{d}/t") is None: raise BuildError("What was downloaded is not an AppImage, so it was not installed.")
+        return install_tool(f"{d}/t", *([dest] if dest else []))
+
+
+def download_runtime(dest=None, opener=None):
+    """Download the AppImage runtime for this machine and install it. Returns where it went."""
+    with tempfile.TemporaryDirectory(prefix="satchel-dl-") as d:
+        download(RUNTIME_DL.format(arch=platform.machine()), f"{d}/r", opener)
+        return install_runtime(f"{d}/r", dest)
+
+
+def runtime_problem(path):
+    """Why path can't be used as the AppImage runtime, or None. A runtime is a small type 2 ELF program; a complete
+    AppImage (appimagetool itself, say) also starts with that ELF but has a whole program attached, and using it
+    would make every AppImage you build start that program instead of yours."""
+    try:
+        with open(path, "rb") as f: h = f.read(64)
+    except OSError as e: return f"Could not read it: {e}"
+    if h[:4] != b"\x7fELF": return "It is not a program file (it should start with ELF). Did the download save a web page?"
+    if h[8:11] != b"AI\x02": return "It is not an AppImage runtime (no type 2 marker)."
+    if appimage_offset(path) is not None: return "It is a complete AppImage (such as appimagetool itself), not the small runtime file."
+    return None
+
+
+def find_runtime(root=None):
+    """The AppImage runtime file, so appimagetool does not have to download it: yours, or one shipped inside the tool."""
+    for p in (os.environ.get("APPIMAGE_RUNTIME"), f"{RUNTIME_DIR}/runtime-{platform.machine()}",
+              root and f"{root}/usr/lib/appimagekit/runtime"):
+        if p and os.path.isfile(p) and not runtime_problem(p): return p
+    return None
+
+
+def find_runtime_download():
+    """A runtime-<arch> file you already downloaded into ~/Downloads (newest first), or None."""
+    d = os.path.expanduser("~/Downloads")
+    try: names = [f for f in os.listdir(d) if f.lower().startswith("runtime") and platform.machine() in f]
+    except OSError: return None
+    files = [f"{d}/{n}" for n in names if os.path.isfile(f"{d}/{n}") and not runtime_problem(f"{d}/{n}")]
+    return max(files, key=os.path.getmtime) if files else None
+
+
+def install_runtime(src, dest=None):
+    """Copy a downloaded runtime file to ~/.local/share/satchel/ after checking it really is a runtime."""
+    dest = dest or f"{RUNTIME_DIR}/runtime-{platform.machine()}"
+    why = runtime_problem(src)
+    if why: raise BuildError(why)
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    shutil.copyfile(src, dest + ".new"); os.chmod(dest + ".new", 0o644); os.replace(dest + ".new", dest)
+    return dest
+
+
+CACHE = os.path.expanduser("~/.cache/satchel")
+
+
+def prepare_tool(tool):
+    """(program to run, folder it needs or None). An AppImage tool is unpacked once and run as an ordinary program: with
+    'ajail on' every AppImage is started inside a second sandbox that cannot see the build folder."""
+    real = os.path.realpath(tool)
+    off = appimage_offset(real)
+    if off is None: return real, None
+    st = os.stat(real)
+    base = f"{CACHE}/{clean(os.path.basename(real))}-{st.st_size}-{st.st_mtime_ns}"
+    root = f"{base}/root"
+    if not os.path.isfile(f"{root}/AppRun"):
+        unsq = shutil.which("unsquashfs")
+        if not unsq: raise BuildError(f"unsquashfs is needed to unpack appimagetool: {install_hint('squashfs-tools')}")
+        shutil.rmtree(base, ignore_errors=True)
+        os.makedirs(base, mode=0o700)
+        tmp = f"{base}/root.tmp"
+        try: r = subprocess.run([unsq, "-no-progress", "-no-xattrs", "-o", str(off), "-d", tmp, real], capture_output=True,
+                                text=True, errors="replace", stdin=subprocess.DEVNULL, timeout=300)
+        except (OSError, subprocess.TimeoutExpired) as e: raise BuildError(f"Could not unpack appimagetool: {e}")
+        if r.returncode != 0 or not os.path.isfile(f"{tmp}/AppRun"):
+            shutil.rmtree(base, ignore_errors=True)
+            raise BuildError("Could not unpack appimagetool:\n" + (r.stderr or r.stdout).strip()[-600:])
+        subprocess.run(["chmod", "-R", "u+rwX", tmp], check=False)
+        os.replace(tmp, root)
+    return f"{root}/AppRun", root
 
 
 def bundle_libraries(appdir, ident, exe, log=None, cancel=None, bwrap=None):
@@ -808,270 +1081,6 @@ def make_appdir(src, name, exe, icon, category, terminal, appdir, version="", co
     with open(f"{appdir}/AppRun", "w") as f: f.write(apprun_script(ident, exe, app_libs(src, exe), usr_layout(src, exe), bundle))
     os.chmod(f"{appdir}/AppRun", 0o755)
     return ident
-
-
-RUNTIME_URL = "https://github.com/AppImage/type2-runtime/releases"
-TOOL_DL = "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-{arch}.AppImage"
-RUNTIME_DL = "https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-{arch}"
-MAX_DOWNLOAD = 200 * 1024 * 1024
-RUNTIME_DIR = os.path.expanduser("~/.local/share/satchel")
-TOOL_HOME = os.path.expanduser("~/.local/bin/appimagetool")
-
-
-def find_tool():
-    return os.environ.get("APPIMAGETOOL") or shutil.which("appimagetool") or next(
-        (p for p in (TOOL_HOME, os.path.expanduser("~/bin/appimagetool")) if os.access(p, os.X_OK)), None)
-
-
-def find_download():
-    """An appimagetool file you already downloaded into ~/Downloads (newest first), or None."""
-    d = os.path.expanduser("~/Downloads")
-    try: names = [f for f in os.listdir(d) if f.lower().startswith("appimagetool")]
-    except OSError: return None
-    files = [f"{d}/{n}" for n in names if os.path.isfile(f"{d}/{n}")]
-    files.sort(key=lambda p: (platform.machine() not in os.path.basename(p), -os.path.getmtime(p)))
-    return files[0] if files else None
-
-
-def install_tool(src, dest=TOOL_HOME):
-    """Copy a file you downloaded to ~/.local/bin/appimagetool and make it executable. Refuses anything that isn't a program."""
-    try:
-        with open(src, "rb") as f: magic = f.read(4)
-    except OSError as e: raise BuildError(f"Could not read that file: {e}")
-    if magic != b"\x7fELF": raise BuildError("That is not a program file (an AppImage starts with ELF). Did the download save a web page?")
-    os.makedirs(os.path.dirname(dest), exist_ok=True)
-    tmp = dest + ".new"
-    shutil.copyfile(src, tmp); os.chmod(tmp, 0o755); os.replace(tmp, dest)
-    return dest
-
-
-def download(url, dest, opener=None):
-    """Fetch an https address into the file dest (at most MAX_DOWNLOAD bytes). Raises BuildError; leaves no partial file."""
-    import urllib.request
-    opener = opener or urllib.request.urlopen
-    if not url.startswith("https://"): raise BuildError("Only https downloads are allowed.")
-    try:
-        with opener(urllib.request.Request(url, headers={"User-Agent": "satchel"}), timeout=30) as r, open(dest, "wb") as f:
-            if not r.geturl().startswith("https://"): raise BuildError("The download was redirected to an address that is not https.")
-            total = 0
-            while True:
-                chunk = r.read(65536)
-                if not chunk: break
-                total += len(chunk)
-                if total > MAX_DOWNLOAD: raise BuildError("The download is larger than expected, so it was stopped.")
-                f.write(chunk)
-    except BuildError:
-        if os.path.exists(dest): os.unlink(dest)
-        raise
-    except OSError as e:
-        if os.path.exists(dest): os.unlink(dest)
-        raise BuildError(f"Could not download {url}\n{e}\nUse 'Use a downloaded file…' instead.")
-
-
-def download_tool(dest=None, opener=None):
-    """Download appimagetool for this machine and install it. Returns where it went."""
-    with tempfile.TemporaryDirectory(prefix="satchel-dl-") as d:
-        download(TOOL_DL.format(arch=platform.machine()), f"{d}/t", opener)
-        if appimage_offset(f"{d}/t") is None: raise BuildError("What was downloaded is not an AppImage, so it was not installed.")
-        return install_tool(f"{d}/t", *([dest] if dest else []))
-
-
-def download_runtime(dest=None, opener=None):
-    """Download the AppImage runtime for this machine and install it. Returns where it went."""
-    with tempfile.TemporaryDirectory(prefix="satchel-dl-") as d:
-        download(RUNTIME_DL.format(arch=platform.machine()), f"{d}/r", opener)
-        return install_runtime(f"{d}/r", dest)
-
-
-def runtime_problem(path):
-    """Why path can't be used as the AppImage runtime, or None. A runtime is a small type 2 ELF program; a complete
-    AppImage (appimagetool itself, say) also starts with that ELF but has a whole program attached, and using it
-    would make every AppImage you build start that program instead of yours."""
-    try:
-        with open(path, "rb") as f: h = f.read(64)
-    except OSError as e: return f"Could not read it: {e}"
-    if h[:4] != b"\x7fELF": return "It is not a program file (it should start with ELF). Did the download save a web page?"
-    if h[8:11] != b"AI\x02": return "It is not an AppImage runtime (no type 2 marker)."
-    if appimage_offset(path) is not None: return "It is a complete AppImage (such as appimagetool itself), not the small runtime file."
-    return None
-
-
-def find_runtime(root=None):
-    """The AppImage runtime file, so appimagetool does not have to download it: yours, or one shipped inside the tool."""
-    for p in (os.environ.get("APPIMAGE_RUNTIME"), f"{RUNTIME_DIR}/runtime-{platform.machine()}",
-              root and f"{root}/usr/lib/appimagekit/runtime"):
-        if p and os.path.isfile(p) and not runtime_problem(p): return p
-    return None
-
-
-def find_runtime_download():
-    """A runtime-<arch> file you already downloaded into ~/Downloads (newest first), or None."""
-    d = os.path.expanduser("~/Downloads")
-    try: names = [f for f in os.listdir(d) if f.lower().startswith("runtime") and platform.machine() in f]
-    except OSError: return None
-    files = [f"{d}/{n}" for n in names if os.path.isfile(f"{d}/{n}") and not runtime_problem(f"{d}/{n}")]
-    return max(files, key=os.path.getmtime) if files else None
-
-
-def install_runtime(src, dest=None):
-    """Copy a downloaded runtime file to ~/.local/share/satchel/ after checking it really is a runtime."""
-    dest = dest or f"{RUNTIME_DIR}/runtime-{platform.machine()}"
-    why = runtime_problem(src)
-    if why: raise BuildError(why)
-    os.makedirs(os.path.dirname(dest), exist_ok=True)
-    shutil.copyfile(src, dest + ".new"); os.chmod(dest + ".new", 0o644); os.replace(dest + ".new", dest)
-    return dest
-
-
-def appimage_offset(path):
-    """Where the squashfs image starts inside a type 2 AppImage (right after its ELF section headers), or None if it isn't one."""
-    try:
-        with open(path, "rb") as f:
-            h = f.read(64)
-            if len(h) < 64 or h[:4] != b"\x7fELF" or h[8:11] != b"AI\x02": return None
-            e = "<" if h[5] == 1 else ">"
-            if h[4] == 2: shoff, = struct.unpack_from(e + "Q", h, 0x28); sz, num = struct.unpack_from(e + "HH", h, 0x3A)
-            else: shoff, = struct.unpack_from(e + "I", h, 0x20); sz, num = struct.unpack_from(e + "HH", h, 0x2E)
-            off = shoff + sz * num
-            f.seek(off)
-            return off if f.read(4) in (b"hsqs", b"sqsh") else None
-    except (OSError, struct.error):
-        return None
-
-
-CACHE = os.path.expanduser("~/.cache/satchel")
-
-
-def prepare_tool(tool):
-    """(program to run, folder it needs or None). An AppImage tool is unpacked once and run as an ordinary program: with
-    'ajail on' every AppImage is started inside a second sandbox that cannot see the build folder."""
-    real = os.path.realpath(tool)
-    off = appimage_offset(real)
-    if off is None: return real, None
-    st = os.stat(real)
-    base = f"{CACHE}/{clean(os.path.basename(real))}-{st.st_size}-{st.st_mtime_ns}"
-    root = f"{base}/root"
-    if not os.path.isfile(f"{root}/AppRun"):
-        unsq = shutil.which("unsquashfs")
-        if not unsq: raise BuildError(f"unsquashfs is needed to unpack appimagetool: {install_hint('squashfs-tools')}")
-        shutil.rmtree(base, ignore_errors=True)
-        os.makedirs(base, mode=0o700)
-        tmp = f"{base}/root.tmp"
-        try: r = subprocess.run([unsq, "-no-progress", "-no-xattrs", "-o", str(off), "-d", tmp, real], capture_output=True,
-                                text=True, errors="replace", stdin=subprocess.DEVNULL, timeout=300)
-        except (OSError, subprocess.TimeoutExpired) as e: raise BuildError(f"Could not unpack appimagetool: {e}")
-        if r.returncode != 0 or not os.path.isfile(f"{tmp}/AppRun"):
-            shutil.rmtree(base, ignore_errors=True)
-            raise BuildError("Could not unpack appimagetool:\n" + (r.stderr or r.stdout).strip()[-600:])
-        subprocess.run(["chmod", "-R", "u+rwX", tmp], check=False)
-        os.replace(tmp, root)
-    return f"{root}/AppRun", root
-
-
-def need_bwrap():
-    """The bubblewrap program, or a BuildError that says how to install it."""
-    bwrap = shutil.which("bwrap")
-    if not bwrap: raise BuildError(f"The sandbox is switched on but bubblewrap (bwrap) was not found: {install_hint('bubblewrap')}")
-    return bwrap
-
-
-def display_args(env):
-    """(bubblewrap arguments, environment pairs) that let a program in the sandbox use your screen: the Wayland socket
-    and/or the X11 socket with its login file, plus /dev/dri for graphics. Nothing else of your session is shown, and
-    the network stays off. With no screen in env this adds nothing."""
-    a, e = [], []
-    run = env.get("XDG_RUNTIME_DIR", "")
-    wl = env.get("WAYLAND_DISPLAY", "")
-    if run and wl:
-        sock = wl if os.path.isabs(wl) else os.path.join(run, wl)
-        if os.path.exists(sock):
-            a += ["--ro-bind", sock, f"/run/satchel-display/{os.path.basename(sock)}"]
-            e += [("XDG_RUNTIME_DIR", "/run/satchel-display"), ("WAYLAND_DISPLAY", os.path.basename(sock))]
-    disp = env.get("DISPLAY", "")
-    if disp and os.path.isdir("/tmp/.X11-unix"):
-        a += ["--ro-bind", "/tmp/.X11-unix", "/tmp/.X11-unix"]
-        e.append(("DISPLAY", disp))
-        xa = env.get("XAUTHORITY") or os.path.expanduser("~/.Xauthority")
-        if os.path.isfile(xa):
-            a += ["--ro-bind", os.path.realpath(xa), "/run/satchel-display/Xauthority"]
-            e.append(("XAUTHORITY", "/run/satchel-display/Xauthority"))
-    if e: a += ["--dev-bind-try", "/dev/dri", "/dev/dri"]
-    return a, e
-
-
-def bwrap_base(bwrap, show, work, arch, home, net, version="", display=False):
-    """The bubblewrap part of a command, ending in '--': the system is read-only, your real home and other users are
-    hidden, /tmp is fresh, and only the work folder is writable. Network only if net (it is needed to download the
-    runtime when you have not set one). Files in show that lie inside your home are shown read-only. No system-call
-    filter: this is a convenience sandbox, not a security boundary. With display, the screen is let through (see
-    display_args) so a window program can open its window; the network stays off."""
-    parent = os.path.dirname(home)
-    a = [bwrap, "--unshare-all", *(["--share-net"] if net else []), "--die-with-parent", "--new-session", "--clearenv",
-         "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--tmpfs", "/run"]
-    if net: a += [x for d in ("/run/systemd/resolve", "/run/NetworkManager") for x in ("--ro-bind-try", d, d)]   # DNS
-    a += ["--tmpfs", parent] if parent != "/" else []
-    a += ["--tmpfs", home]
-    for d in ("/root", "/mnt", "/media", "/srv"):
-        if os.path.isdir(d) and not os.path.islink(d) and home != d and not home.startswith(d + "/"): a += ["--tmpfs", d]
-    for q in dict.fromkeys(os.path.realpath(x) for x in show if x):
-        if q.startswith(home + "/"): a += ["--ro-bind", q, q]
-    a += ["--bind", work, work]
-    envs = []
-    if display:
-        more, envs = display_args(os.environ)
-        a += more
-    for k, v in (*envs, ("HOME", home), ("PATH", "/usr/local/bin:/usr/bin:/usr/sbin"), ("LANG", "C.UTF-8"), ("ARCH", arch),
-                 *((("VERSION", version),) if version else ())):
-        a += ["--setenv", k, v]
-    return a + ["--chdir", work, "--"]
-
-
-def bwrap_cmd(bwrap, exe, share, runtime, appdir, out, work, arch, home, net, version=""):
-    """appimagetool inside bubblewrap (see bwrap_base). A tool or runtime file inside your home is shown read-only."""
-    return (bwrap_base(bwrap, (share or exe, runtime), work, arch, home, net, version)
-            + [exe, *(["--runtime-file", runtime] if runtime else []), appdir, out])
-
-
-def run_streaming(cmd, env, cwd, log=None, cancel=None, timeout=600, timeout_is_error=True, own_group=True):
-    """Run cmd and hand each line of its output (errors included) to log as it appears. The program is stopped when
-    cancel is set (raises Cancelled), on Ctrl-C, or after timeout seconds (raises BuildError, or just returns when
-    timeout_is_error is False). With own_group it runs in a process group of its own and the whole group is stopped;
-    without it only cmd itself is stopped (bubblewrap cannot be a group leader because it starts its own session, and it
-    takes everything inside it down with it). Returns (exit code or None, the last lines of output, timed out)."""
-    if log: log("$ " + shlex.join(cmd))
-    try: p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace", env=env,
-                              cwd=cwd, stdin=subprocess.DEVNULL, start_new_session=own_group)
-    except OSError as e: raise BuildError(f"Could not start {os.path.basename(cmd[0])}: {e}")
-    tail = collections.deque(maxlen=200)
-
-    def pump():
-        for line in p.stdout:
-            line = line.rstrip("\n"); tail.append(line)
-            if log: log(line)
-    reader = threading.Thread(target=pump, daemon=True); reader.start()
-
-    def stop():
-        for sig in (signal.SIGTERM, signal.SIGKILL):
-            try: os.killpg(p.pid, sig) if own_group else p.send_signal(sig)
-            except OSError: break
-            try: p.wait(timeout=3); break
-            except subprocess.TimeoutExpired: pass
-    why, deadline = None, time.monotonic() + timeout
-    try:
-        while True:
-            try: p.wait(timeout=0.1); break
-            except subprocess.TimeoutExpired: pass
-            if cancel is not None and cancel.is_set(): why = "cancel"
-            elif time.monotonic() > deadline: why = "timeout"
-            if why: stop(); break
-    except BaseException:
-        stop(); raise
-    reader.join(timeout=5)
-    if not reader.is_alive(): p.stdout.close()
-    text = "\n".join(tail)
-    if why == "cancel": raise Cancelled("Cancelled.")
-    if why == "timeout" and timeout_is_error: raise BuildError(f"It ran for more than {timeout:g} seconds, so it was stopped.")
-    return (None if why else p.returncode), text, why == "timeout"
 
 
 def build(src, name, exe, icon, category, terminal, out_dir, tool=None, sandbox=False, version="", log=None, cancel=None, comment="", bundle=False):
@@ -1212,6 +1221,34 @@ def cli_run(a):
         return 1
     if note: print(note, file=sys.stderr)
     return 0
+
+
+SETTINGS = os.path.expanduser("~/.config/satchel/settings.json")
+
+
+def load_settings(path=None):
+    """The choices saved from the last run. Each value is checked; anything missing or wrong is left out."""
+    try:
+        with open(path or SETTINGS) as f: raw = json.load(f)
+    except (OSError, ValueError): return {}
+    if not isinstance(raw, dict): return {}
+    out = {}
+    if isinstance(raw.get("out_dir"), str) and os.path.isdir(raw["out_dir"]): out["out_dir"] = raw["out_dir"]
+    if isinstance(raw.get("last_dir"), str) and os.path.isdir(raw["last_dir"]): out["last_dir"] = raw["last_dir"]
+    if raw.get("category") in CATEGORIES: out["category"] = raw["category"]
+    for k in ("terminal", "sandbox"):
+        if isinstance(raw.get(k), bool): out[k] = raw[k]
+    return out
+
+
+def save_settings(data, path=None):
+    """Remember the choices. This is a convenience, so a failure to write is ignored and never stops a build."""
+    path = path or SETTINGS
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path + ".new", "w") as f: json.dump(data, f, indent=1)
+        os.replace(path + ".new", path)
+    except OSError: pass
 
 
 # ---- window (GTK is loaded only here, so the functions above can be tested without it) ----

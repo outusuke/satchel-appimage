@@ -36,6 +36,12 @@ A program, or a folder it sits in, that is a symbolic link leading outside the p
 
 `--dry-run` prints the files that would be made and builds nothing. `--try` only starts the program to see that it works.
 
+## Development
+
+`satchel` is built from the fragments in `src/` (named `NN_name.py`, joined in name order; a fragment may only use names from its own or a lower-numbered one).
+Edit `src/`, then run `python3 build.py` to rewrite `satchel`; `python3 build.py --check` fails if `satchel` is not exactly what `src/` builds.
+The build refuses to run when the layer rule is broken. The installable program is still the single file `satchel`.
+
 ## Tests
 
     python3 test_satchel.py
