@@ -774,6 +774,39 @@ class Logic(unittest.TestCase):
         err = io.StringIO()
         with contextlib.redirect_stderr(err): self.assertEqual(M["cli"]([f"{self.t}/no.deb", "--dry-run"]), 1)
 
+    def test_writable_data_folder_links_packed_files_and_copies_settings(self):
+        d = f"{self.t}/prog"; os.makedirs(f"{d}/translations/en"); os.makedirs(f"{d}/puzzles")
+        put(f"{d}/translations/en/a.ftl", "hello"); put(f"{d}/settings.json", "{}"); put(f"{d}/puzzles/info.txt", "i"); put(f"{d}/big.dat", "x" * 70000)
+        script(f"{d}/run", 'pwd; cat translations/en/a.ftl; echo; echo new > settings.json; echo db > puzzles/db.csv\n')
+        os.chmod(f"{d}/puzzles", 0o555)                                           # like a read-only image: copies must still be writable
+        self.assertEqual(M["data_copies"](d, "run"), ["settings.json"])           # small plain files only: not the program, not big data
+        self.assertEqual(M["data_copies"](d, "run", ["puzzles", "puzzles/x"]), ["puzzles", "settings.json"])
+        home = f"{self.t}/home"; os.makedirs(home); env = {**os.environ, "HOME": home}; env.pop("XDG_DATA_HOME", None)
+        ad = f"{self.t}/AD"; M["make_appdir"](d, "My App", "run", None, "Utility", False, ad, data=["puzzles"])
+        r = subprocess.run([f"{ad}/AppRun"], capture_output=True, text=True, env=env)
+        data = f"{home}/.local/share/My_App"
+        self.assertEqual(r.stdout.split("\n")[:2], [data, "hello"], r.stderr)    # starts in the data folder and sees the packed files
+        self.assertTrue(os.path.islink(f"{data}/translations")); self.assertTrue(os.path.islink(f"{data}/run"))
+        self.assertFalse(os.path.islink(f"{data}/settings.json")); self.assertEqual(get(f"{data}/settings.json").strip(), "new")
+        self.assertEqual(get(f"{data}/puzzles/db.csv").strip(), "db")
+        ad2 = f"{self.t}/AD2"; shutil.move(ad, ad2)                                # the next start is mounted somewhere else
+        os.chmod(f"{d}/puzzles", 0o755); shutil.rmtree(d)                          # the old links now dangle
+        self.assertFalse(os.path.exists(f"{data}/translations"))
+        r = subprocess.run([f"{ad2}/AppRun"], capture_output=True, text=True, env=env)
+        self.assertEqual(r.stdout.split("\n")[1], "hello", r.stderr)              # relinked
+        self.assertEqual(get(f"{data}/settings.json").strip(), "new")              # the program's change was kept, not overwritten
+
+    def test_writable_data_is_off_by_default_and_shown_in_the_preview(self):
+        d = self.prog_folder()
+        self.assertNotIn("DATA=", M["apprun_script"]("a", "run", []))
+        ident, _, apprun = M["preview"](d, "My App", "bin/run", None, "Utility", False, data=[])
+        self.assertIn(".local/share", apprun); self.assertEqual(apprun, M["apprun_script"]("My_App", "bin/run", M["app_libs"](d, "bin/run"), False, False, M["data_copies"](d, "bin/run")))
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.assertEqual(M["cli"]([d, "--exe", "bin/run", "--dry-run", "--writable-data", "--writable", "data"]), 0)
+            self.assertEqual(M["cli"]([d, "--exe", "bin/run", "--dry-run", "--writable", "data"]), 1)
+        self.assertIn("cp -a", out.getvalue()); self.assertIn("--writable only works", err.getvalue())
+
     def test_bundling_runs_linuxdeploy_and_needs_it(self):
         root = f"{self.t}/root"; M["unpack_package"](self.sample_deb(), root)
         old = os.environ["PATH"]

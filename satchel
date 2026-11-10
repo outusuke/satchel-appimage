@@ -1072,18 +1072,43 @@ def usr_layout(src, exe):
             and os.path.normpath(exe or "").replace(os.sep, "/").startswith(("usr/", "opt/")))
 
 
-def apprun_script(ident, exe, libs, usr=False, bundled=False):
+DATA_COPY_MAX = 64 * 1024       # a settings-like file this small, next to the program, is copied, not linked
+DATA_COPY_EXT = (".json", ".ini", ".cfg", ".conf", ".toml", ".yaml", ".yml", ".xml", ".properties")
+
+
+def data_copies(src, exe, extra=()):
+    """Names (in the packed folder's top level) that a writable-data AppRun copies into the data folder instead of linking:
+    small settings-like files (settings.json, *.ini, *.conf, …), plus anything the person listed in extra."""
+    names = {os.path.normpath(n).split(os.sep)[0] for n in extra if n.strip()}
+    if os.path.isdir(src):
+        for n in os.listdir(src):
+            p = os.path.join(src, n)
+            if os.path.isfile(p) and not os.path.islink(p) and os.path.getsize(p) <= DATA_COPY_MAX and n.lower().endswith(DATA_COPY_EXT): names.add(n)
+    names.discard("."); names.discard("..")
+    return sorted(names)
+
+
+def apprun_script(ident, exe, libs, usr=False, bundled=False, data=None):
     """The text of AppRun: it starts the program, with LD_LIBRARY_PATH pointing at the .so folders packed next to it.
     usr (an unpacked package) also puts the package's usr/bin and usr/share on PATH and XDG_DATA_DIRS; bundled adds
-    the folder linuxdeploy copied libraries into."""
+    the folder linuxdeploy copied libraries into. data (a list of names, possibly empty; None means off) makes AppRun work from a
+    writable folder, ~/.local/share/<ident>, because an AppImage is read-only: every top-level item of the packed folder is linked
+    into it afresh on each start (the AppImage is mounted somewhere new each time), except the names in data, which are copied
+    once and then left alone so the program can change them."""
     out = '#!/bin/sh\nHERE="$(dirname "$(readlink -f "$0")")"\n'
-    if libs or usr or bundled: out += f'APP="$HERE"/{shlex.quote(f"usr/lib/{ident}")}\n'
+    if libs or usr or bundled or data is not None: out += f'APP="$HERE"/{shlex.quote(f"usr/lib/{ident}")}\n'
     parts = [('"$APP"' if r == "." else '"$APP"/' + shlex.quote(r)) for r in libs] + (['"$HERE"/usr/lib'] if bundled else [])
     if parts:                                       # let the program find the .so files packed next to it
         out += f'LD_LIBRARY_PATH={":".join(parts)}"${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}"; export LD_LIBRARY_PATH\n'
     if usr:
         out += ('PATH="$APP"/usr/bin:"$APP"/usr/games"${PATH:+:$PATH}"; export PATH\n'
                 'XDG_DATA_DIRS="$APP"/usr/share:"${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"; export XDG_DATA_DIRS\n')
+    if data is not None:
+        arms = ("|".join(shlex.quote(n) for n in data) + ') [ -e "$DATA/$n" ] || { cp -a "$f" "$DATA/$n" && chmod -R u+w "$DATA/$n"; } ;;\n    ') if data else ""
+        out += (f'DATA="${{XDG_DATA_HOME:-$HOME/.local/share}}"/{shlex.quote(ident)}\nmkdir -p "$DATA" || exit 1\n'
+                'for f in "$APP"/* "$APP"/.[!.]*; do\n  [ -e "$f" ] || continue\n  n="${f##*/}"\n  case "$n" in\n'
+                f'    {arms}*) if [ -L "$DATA/$n" ] || [ ! -e "$DATA/$n" ]; then ln -sfn "$f" "$DATA/$n"; fi ;;\n  esac\ndone\n'
+                'cd "$DATA" || exit 1\n')
     return out + f'exec "$HERE"/{shlex.quote(f"usr/lib/{ident}/{exe}")} "$@"\n'
 
 
@@ -1092,19 +1117,19 @@ def app_libs(src, exe):
     return library_dirs(src, 5 if usr_layout(src, exe) else 3) if os.path.isdir(src) else []
 
 
-def preview(src, name, exe, icon, category, terminal, version="", comment="", bundle=False):
+def preview(src, name, exe, icon, category, terminal, version="", comment="", bundle=False, data=None):
     """(clean name, .desktop text, AppRun text) exactly as a build would write them, with the same checks and without
     copying anything."""
     name, version, comment, ident, exe, _ext = check_inputs(src, name, exe, icon, category, version, comment)
     real = os.path.realpath(src)
     return (ident, desktop_file(ident, name, category, terminal, version, comment),
-            apprun_script(ident, exe, app_libs(real, exe), usr_layout(real, exe), bundle))
+            apprun_script(ident, exe, app_libs(real, exe), usr_layout(real, exe), bundle, None if data is None else data_copies(real, exe, data)))
 
 
-def make_appdir(src, name, exe, icon, category, terminal, appdir, version="", comment="", bundle=False, log=None, cancel=None, bwrap=None):
+def make_appdir(src, name, exe, icon, category, terminal, appdir, version="", comment="", bundle=False, log=None, cancel=None, bwrap=None, data=None):
     """Lay out an AppDir in appdir (must not exist). src is a file or a folder; exe is the program to start,
     relative to the folder (ignored for a single file). With bundle, linuxdeploy copies the libraries the program needs into
-    the AppDir. Returns the clean name used for files."""
+    the AppDir. data (None = off, else a list of extra names to copy) makes AppRun use a writable data folder (see apprun_script). Returns the clean name used for files."""
     name, version, comment, ident, exe, ext = check_inputs(src, name, exe, icon, category, version, comment)
     src = os.path.realpath(src)
     lib = f"{appdir}/usr/lib/{ident}"
@@ -1120,12 +1145,12 @@ def make_appdir(src, name, exe, icon, category, terminal, appdir, version="", co
     shutil.copy2(f"{appdir}/{ident}{ext}", f"{appdir}/.DirIcon")
     with open(f"{appdir}/{ident}.desktop", "w") as f: f.write(desktop_file(ident, name, category, terminal, version, comment))
     if bundle: bundle_libraries(appdir, ident, exe, log, cancel, bwrap)
-    with open(f"{appdir}/AppRun", "w") as f: f.write(apprun_script(ident, exe, app_libs(src, exe), usr_layout(src, exe), bundle))
+    with open(f"{appdir}/AppRun", "w") as f: f.write(apprun_script(ident, exe, app_libs(src, exe), usr_layout(src, exe), bundle, None if data is None else data_copies(src, exe, data)))
     os.chmod(f"{appdir}/AppRun", 0o755)
     return ident
 
 
-def build(src, name, exe, icon, category, terminal, out_dir, tool=None, sandbox=False, version="", log=None, cancel=None, comment="", bundle=False):
+def build(src, name, exe, icon, category, terminal, out_dir, tool=None, sandbox=False, version="", log=None, cancel=None, comment="", bundle=False, data=None):
     """Make the AppDir in a temporary folder, run appimagetool on it (optionally inside bubblewrap), and move the
     result to out_dir. Returns the path of the .AppImage. A version goes into the desktop file, the file name and
     the VERSION variable that appimagetool reads; a comment goes into the desktop file. log(line) is called with the tool's output while it runs; setting
@@ -1142,7 +1167,7 @@ def build(src, name, exe, icon, category, terminal, out_dir, tool=None, sandbox=
         tmp = os.path.realpath(tmp)
         appdir = f"{tmp}/AppDir"
         if log: log("Making the app folder…")
-        ident = make_appdir(src, name, exe, icon, category, terminal, appdir, version, comment, bundle, log, cancel, bwrap)
+        ident = make_appdir(src, name, exe, icon, category, terminal, appdir, version, comment, bundle, log, cancel, bwrap, data)
         arch = platform.machine()
         stem = f"{ident}-{clean(version)}-{arch}" if version else f"{ident}-{arch}"
         built = f"{tmp}/{stem}.AppImage"
@@ -1180,7 +1205,7 @@ def describe_run(code, text, timed_out, seconds, sandboxed):
     return "\n".join(lines) + (f"\n\nOutput:\n{tail}" if tail else "")
 
 
-def try_run(src, name, exe, icon, category, terminal, sandbox=False, seconds=5, log=None, cancel=None, bundle=False):
+def try_run(src, name, exe, icon, category, terminal, sandbox=False, seconds=5, log=None, cancel=None, bundle=False, data=None):
     """Start the packed program the way the AppImage would and watch it for a few seconds (inside bubblewrap, with no
     network and your home hidden but your screen shared, when sandbox is on). Returns (ok, a description); ok means it ran fine or was still
     running when the time was up. It catches a wrong program, a missing library or a format error before you build."""
@@ -1188,7 +1213,7 @@ def try_run(src, name, exe, icon, category, terminal, sandbox=False, seconds=5, 
     with tempfile.TemporaryDirectory(prefix="satchel-try-") as tmp:
         tmp = os.path.realpath(tmp)
         appdir = f"{tmp}/AppDir"
-        make_appdir(src, name, exe, icon, category, terminal, appdir, "", "", bundle, log, cancel, bwrap)   # the same checks as a build
+        make_appdir(src, name, exe, icon, category, terminal, appdir, "", "", bundle, log, cancel, bwrap, data)   # the same checks as a build
         cmd = [f"{appdir}/AppRun"]
         if bwrap: cmd = bwrap_base(bwrap, (), tmp, platform.machine(), os.path.realpath(os.path.expanduser("~")), False, display=True) + cmd
         code, text, timed_out = run_streaming(cmd, os.environ, tmp, log, cancel, seconds, False, own_group=not bwrap)
@@ -1208,6 +1233,11 @@ def cli(argv):
     p.add_argument("--comment", default="", help="a short description for the desktop file")
     p.add_argument("--terminal", action="store_true", help="the app runs in a terminal")
     p.add_argument("--bundle-libs", action="store_true", help="copy the libraries the program needs into the AppImage (needs linuxdeploy)")
+    p.add_argument("--writable-data", action="store_true",
+                   help="for programs that read and write files next to themselves: AppRun works from ~/.local/share/<name>, "
+                        "with the packed files linked in (small files such as settings.json are copied, so they can change)")
+    p.add_argument("--writable", action="append", default=[], metavar="NAME",
+                   help="with --writable-data: also copy this file or folder (top level of the program folder) instead of linking it; repeatable")
     p.add_argument("--out", default=".", help="folder for the result (default: here)")
     p.add_argument("--sandbox", action="store_true", help="run appimagetool (or the test run) inside bubblewrap")
     p.add_argument("--try", dest="try_first", action="store_true",
@@ -1244,6 +1274,8 @@ def cli(argv):
 
 def cli_run(a):
     name = a.name or default_name(os.path.realpath(a.source))
+    data = (a.writable or []) if a.writable_data else None
+    if a.writable and not a.writable_data: print("--writable only works together with --writable-data.", file=sys.stderr); return 1
     log = (lambda line: print(line, file=sys.stderr)) if a.verbose else None
     note = packing_notes(a.source, a.exe, a.bundle_libs)
     if not a.icon and os.path.isdir(a.source):
@@ -1251,16 +1283,16 @@ def cli_run(a):
         if a.icon: print(f"Icon found in the folder: {a.icon}", file=sys.stderr)
     try:
         if a.dry_run:
-            ident, desktop, apprun = preview(a.source, name, a.exe, a.icon, a.category, a.terminal, a.version, a.comment, a.bundle_libs)
+            ident, desktop, apprun = preview(a.source, name, a.exe, a.icon, a.category, a.terminal, a.version, a.comment, a.bundle_libs, data)
             print(f"--- {ident}.desktop ---\n{desktop}\n--- AppRun ---\n{apprun}", end="")
             if note: print(note, file=sys.stderr)
             return 0
         if a.try_first:
-            ok, text = try_run(a.source, name, a.exe, a.icon, a.category, a.terminal, a.sandbox, a.seconds, log, None, a.bundle_libs)
+            ok, text = try_run(a.source, name, a.exe, a.icon, a.category, a.terminal, a.sandbox, a.seconds, log, None, a.bundle_libs, data)
             print(text)
             if note: print(note, file=sys.stderr)
             return 0 if ok else 1
-        print(build(a.source, name, a.exe, a.icon, a.category, a.terminal, os.path.abspath(a.out), None, a.sandbox, a.version, log, None, a.comment, a.bundle_libs))
+        print(build(a.source, name, a.exe, a.icon, a.category, a.terminal, os.path.abspath(a.out), None, a.sandbox, a.version, log, None, a.comment, a.bundle_libs, data))
     except BuildError as e:
         print(e, file=sys.stderr)
         return 1
@@ -1371,7 +1403,13 @@ def run_gui():
             if self.saved.get("category"): self.cat_row.set_selected(CATEGORIES.index(self.saved["category"]))
             self.term_row = Adw.SwitchRow(title="Runs in a terminal", active=self.saved.get("terminal", False))
             self.bundle_row = Adw.SwitchRow(title="Bundle libraries (linuxdeploy)", active=False, sensitive=False)
-            for r in (self.name_row, self.ver_row, self.comment_row, self.icon_row, self.cat_row, self.term_row, self.bundle_row): g.add(r)
+            self.data_row = Adw.SwitchRow(title="Writable data folder", active=False,
+                                          subtitle="For programs that save files next to themselves (an AppImage is read-only): "
+                                                   "it starts in ~/.local/share/<name>, with the packed files linked in")
+            self.writ_row = Adw.EntryRow(title="Also copy these, not link (optional, comma-separated)", visible=False)
+            self.data_row.connect("notify::active", lambda *_: self.writ_row.set_visible(self.data_row.get_active()))
+            for r in (self.name_row, self.ver_row, self.comment_row, self.icon_row, self.cat_row, self.term_row, self.bundle_row,
+                      self.data_row, self.writ_row): g.add(r)
             page.add(g)
 
             g = Adw.PreferencesGroup(title="Result")
@@ -1559,6 +1597,11 @@ def run_gui():
                 self.set_source(f.get_path())
             (dlg.select_folder if folder else dlg.open)(self, None, done)
 
+        def data_arg(self):
+            """None when the writable data folder is off, else the extra names to copy."""
+            if not self.data_row.get_active(): return None
+            return [n.strip() for n in self.writ_row.get_text().split(",") if n.strip()]
+
         def bundling(self):
             return self.bundle_row.get_active() and self.bundle_row.get_sensitive()
 
@@ -1666,12 +1709,12 @@ def run_gui():
             self.cancel_ev = cancel = threading.Event()
             args = (self.src, self.name_row.get_text(), exe, self.icon, CATEGORIES[self.cat_row.get_selected()],
                     self.term_row.get_active(), self.out_dir, None, sandbox, self.ver_row.get_text(), self.log_line, cancel,
-                    self.comment_row.get_text(), self.bundling())
+                    self.comment_row.get_text(), self.bundling(), self.data_arg())
             self.save()
             self.show_log(); self.try_btn.set_sensitive(False); self.prev_btn.set_sensitive(False); self.tool_group.set_sensitive(False)
             self.go.set_label("Cancel"); self.go.remove_css_class("suggested-action"); self.go.add_css_class("destructive-action")
             def work():
-                note = packing_notes(self.src, exe, args[-1])
+                note = packing_notes(self.src, exe, self.bundling())
                 try: res = (build(*args), None, False)
                 except Cancelled: res = (None, None, True)
                 except BuildError as e: res = (None, str(e), False)
@@ -1691,7 +1734,7 @@ def run_gui():
             exe = self.exes[self.exe_row.get_selected()] if self.exes else ""
             sandbox = self.box_row.get_active() and self.box_row.get_visible()
             args = (self.src, self.name_row.get_text(), exe, self.icon, CATEGORIES[self.cat_row.get_selected()],
-                    self.term_row.get_active(), sandbox, 5, self.log_line, None, self.bundling())
+                    self.term_row.get_active(), sandbox, 5, self.log_line, None, self.bundling(), self.data_arg())
             self.save()
             self.show_log(); self.try_btn.set_sensitive(False); self.go.set_sensitive(False); self.prev_btn.set_sensitive(False)
             self.tool_group.set_sensitive(False); self.try_btn.set_label("Trying…")
@@ -1705,7 +1748,7 @@ def run_gui():
             if not self.src: return self.alert("Nothing to preview", "Choose a program file or folder first.")
             exe = self.exes[self.exe_row.get_selected()] if self.exes else ""
             try: ident, desktop, apprun = preview(self.src, self.name_row.get_text(), exe, self.icon, CATEGORIES[self.cat_row.get_selected()],
-                                                  self.term_row.get_active(), self.ver_row.get_text(), self.comment_row.get_text(), self.bundling())
+                                                  self.term_row.get_active(), self.ver_row.get_text(), self.comment_row.get_text(), self.bundling(), self.data_arg())
             except BuildError as e: return self.alert("Can't preview it", str(e))
             self.alert("Files that will be made", f"{ident}.desktop\n{desktop}\nAppRun\n{apprun}")
 

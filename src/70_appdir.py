@@ -72,18 +72,43 @@ def usr_layout(src, exe):
             and os.path.normpath(exe or "").replace(os.sep, "/").startswith(("usr/", "opt/")))
 
 
-def apprun_script(ident, exe, libs, usr=False, bundled=False):
+DATA_COPY_MAX = 64 * 1024       # a settings-like file this small, next to the program, is copied, not linked
+DATA_COPY_EXT = (".json", ".ini", ".cfg", ".conf", ".toml", ".yaml", ".yml", ".xml", ".properties")
+
+
+def data_copies(src, exe, extra=()):
+    """Names (in the packed folder's top level) that a writable-data AppRun copies into the data folder instead of linking:
+    small settings-like files (settings.json, *.ini, *.conf, …), plus anything the person listed in extra."""
+    names = {os.path.normpath(n).split(os.sep)[0] for n in extra if n.strip()}
+    if os.path.isdir(src):
+        for n in os.listdir(src):
+            p = os.path.join(src, n)
+            if os.path.isfile(p) and not os.path.islink(p) and os.path.getsize(p) <= DATA_COPY_MAX and n.lower().endswith(DATA_COPY_EXT): names.add(n)
+    names.discard("."); names.discard("..")
+    return sorted(names)
+
+
+def apprun_script(ident, exe, libs, usr=False, bundled=False, data=None):
     """The text of AppRun: it starts the program, with LD_LIBRARY_PATH pointing at the .so folders packed next to it.
     usr (an unpacked package) also puts the package's usr/bin and usr/share on PATH and XDG_DATA_DIRS; bundled adds
-    the folder linuxdeploy copied libraries into."""
+    the folder linuxdeploy copied libraries into. data (a list of names, possibly empty; None means off) makes AppRun work from a
+    writable folder, ~/.local/share/<ident>, because an AppImage is read-only: every top-level item of the packed folder is linked
+    into it afresh on each start (the AppImage is mounted somewhere new each time), except the names in data, which are copied
+    once and then left alone so the program can change them."""
     out = '#!/bin/sh\nHERE="$(dirname "$(readlink -f "$0")")"\n'
-    if libs or usr or bundled: out += f'APP="$HERE"/{shlex.quote(f"usr/lib/{ident}")}\n'
+    if libs or usr or bundled or data is not None: out += f'APP="$HERE"/{shlex.quote(f"usr/lib/{ident}")}\n'
     parts = [('"$APP"' if r == "." else '"$APP"/' + shlex.quote(r)) for r in libs] + (['"$HERE"/usr/lib'] if bundled else [])
     if parts:                                       # let the program find the .so files packed next to it
         out += f'LD_LIBRARY_PATH={":".join(parts)}"${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}"; export LD_LIBRARY_PATH\n'
     if usr:
         out += ('PATH="$APP"/usr/bin:"$APP"/usr/games"${PATH:+:$PATH}"; export PATH\n'
                 'XDG_DATA_DIRS="$APP"/usr/share:"${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"; export XDG_DATA_DIRS\n')
+    if data is not None:
+        arms = ("|".join(shlex.quote(n) for n in data) + ') [ -e "$DATA/$n" ] || { cp -a "$f" "$DATA/$n" && chmod -R u+w "$DATA/$n"; } ;;\n    ') if data else ""
+        out += (f'DATA="${{XDG_DATA_HOME:-$HOME/.local/share}}"/{shlex.quote(ident)}\nmkdir -p "$DATA" || exit 1\n'
+                'for f in "$APP"/* "$APP"/.[!.]*; do\n  [ -e "$f" ] || continue\n  n="${f##*/}"\n  case "$n" in\n'
+                f'    {arms}*) if [ -L "$DATA/$n" ] || [ ! -e "$DATA/$n" ]; then ln -sfn "$f" "$DATA/$n"; fi ;;\n  esac\ndone\n'
+                'cd "$DATA" || exit 1\n')
     return out + f'exec "$HERE"/{shlex.quote(f"usr/lib/{ident}/{exe}")} "$@"\n'
 
 
@@ -92,19 +117,19 @@ def app_libs(src, exe):
     return library_dirs(src, 5 if usr_layout(src, exe) else 3) if os.path.isdir(src) else []
 
 
-def preview(src, name, exe, icon, category, terminal, version="", comment="", bundle=False):
+def preview(src, name, exe, icon, category, terminal, version="", comment="", bundle=False, data=None):
     """(clean name, .desktop text, AppRun text) exactly as a build would write them, with the same checks and without
     copying anything."""
     name, version, comment, ident, exe, _ext = check_inputs(src, name, exe, icon, category, version, comment)
     real = os.path.realpath(src)
     return (ident, desktop_file(ident, name, category, terminal, version, comment),
-            apprun_script(ident, exe, app_libs(real, exe), usr_layout(real, exe), bundle))
+            apprun_script(ident, exe, app_libs(real, exe), usr_layout(real, exe), bundle, None if data is None else data_copies(real, exe, data)))
 
 
-def make_appdir(src, name, exe, icon, category, terminal, appdir, version="", comment="", bundle=False, log=None, cancel=None, bwrap=None):
+def make_appdir(src, name, exe, icon, category, terminal, appdir, version="", comment="", bundle=False, log=None, cancel=None, bwrap=None, data=None):
     """Lay out an AppDir in appdir (must not exist). src is a file or a folder; exe is the program to start,
     relative to the folder (ignored for a single file). With bundle, linuxdeploy copies the libraries the program needs into
-    the AppDir. Returns the clean name used for files."""
+    the AppDir. data (None = off, else a list of extra names to copy) makes AppRun use a writable data folder (see apprun_script). Returns the clean name used for files."""
     name, version, comment, ident, exe, ext = check_inputs(src, name, exe, icon, category, version, comment)
     src = os.path.realpath(src)
     lib = f"{appdir}/usr/lib/{ident}"
@@ -120,6 +145,6 @@ def make_appdir(src, name, exe, icon, category, terminal, appdir, version="", co
     shutil.copy2(f"{appdir}/{ident}{ext}", f"{appdir}/.DirIcon")
     with open(f"{appdir}/{ident}.desktop", "w") as f: f.write(desktop_file(ident, name, category, terminal, version, comment))
     if bundle: bundle_libraries(appdir, ident, exe, log, cancel, bwrap)
-    with open(f"{appdir}/AppRun", "w") as f: f.write(apprun_script(ident, exe, app_libs(src, exe), usr_layout(src, exe), bundle))
+    with open(f"{appdir}/AppRun", "w") as f: f.write(apprun_script(ident, exe, app_libs(src, exe), usr_layout(src, exe), bundle, None if data is None else data_copies(src, exe, data)))
     os.chmod(f"{appdir}/AppRun", 0o755)
     return ident

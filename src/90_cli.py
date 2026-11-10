@@ -11,6 +11,11 @@ def cli(argv):
     p.add_argument("--comment", default="", help="a short description for the desktop file")
     p.add_argument("--terminal", action="store_true", help="the app runs in a terminal")
     p.add_argument("--bundle-libs", action="store_true", help="copy the libraries the program needs into the AppImage (needs linuxdeploy)")
+    p.add_argument("--writable-data", action="store_true",
+                   help="for programs that read and write files next to themselves: AppRun works from ~/.local/share/<name>, "
+                        "with the packed files linked in (small files such as settings.json are copied, so they can change)")
+    p.add_argument("--writable", action="append", default=[], metavar="NAME",
+                   help="with --writable-data: also copy this file or folder (top level of the program folder) instead of linking it; repeatable")
     p.add_argument("--out", default=".", help="folder for the result (default: here)")
     p.add_argument("--sandbox", action="store_true", help="run appimagetool (or the test run) inside bubblewrap")
     p.add_argument("--try", dest="try_first", action="store_true",
@@ -47,6 +52,8 @@ def cli(argv):
 
 def cli_run(a):
     name = a.name or default_name(os.path.realpath(a.source))
+    data = (a.writable or []) if a.writable_data else None
+    if a.writable and not a.writable_data: print("--writable only works together with --writable-data.", file=sys.stderr); return 1
     log = (lambda line: print(line, file=sys.stderr)) if a.verbose else None
     note = packing_notes(a.source, a.exe, a.bundle_libs)
     if not a.icon and os.path.isdir(a.source):
@@ -54,16 +61,16 @@ def cli_run(a):
         if a.icon: print(f"Icon found in the folder: {a.icon}", file=sys.stderr)
     try:
         if a.dry_run:
-            ident, desktop, apprun = preview(a.source, name, a.exe, a.icon, a.category, a.terminal, a.version, a.comment, a.bundle_libs)
+            ident, desktop, apprun = preview(a.source, name, a.exe, a.icon, a.category, a.terminal, a.version, a.comment, a.bundle_libs, data)
             print(f"--- {ident}.desktop ---\n{desktop}\n--- AppRun ---\n{apprun}", end="")
             if note: print(note, file=sys.stderr)
             return 0
         if a.try_first:
-            ok, text = try_run(a.source, name, a.exe, a.icon, a.category, a.terminal, a.sandbox, a.seconds, log, None, a.bundle_libs)
+            ok, text = try_run(a.source, name, a.exe, a.icon, a.category, a.terminal, a.sandbox, a.seconds, log, None, a.bundle_libs, data)
             print(text)
             if note: print(note, file=sys.stderr)
             return 0 if ok else 1
-        print(build(a.source, name, a.exe, a.icon, a.category, a.terminal, os.path.abspath(a.out), None, a.sandbox, a.version, log, None, a.comment, a.bundle_libs))
+        print(build(a.source, name, a.exe, a.icon, a.category, a.terminal, os.path.abspath(a.out), None, a.sandbox, a.version, log, None, a.comment, a.bundle_libs, data))
     except BuildError as e:
         print(e, file=sys.stderr)
         return 1

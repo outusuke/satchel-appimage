@@ -1,4 +1,4 @@
-def build(src, name, exe, icon, category, terminal, out_dir, tool=None, sandbox=False, version="", log=None, cancel=None, comment="", bundle=False):
+def build(src, name, exe, icon, category, terminal, out_dir, tool=None, sandbox=False, version="", log=None, cancel=None, comment="", bundle=False, data=None):
     """Make the AppDir in a temporary folder, run appimagetool on it (optionally inside bubblewrap), and move the
     result to out_dir. Returns the path of the .AppImage. A version goes into the desktop file, the file name and
     the VERSION variable that appimagetool reads; a comment goes into the desktop file. log(line) is called with the tool's output while it runs; setting
@@ -15,7 +15,7 @@ def build(src, name, exe, icon, category, terminal, out_dir, tool=None, sandbox=
         tmp = os.path.realpath(tmp)
         appdir = f"{tmp}/AppDir"
         if log: log("Making the app folder…")
-        ident = make_appdir(src, name, exe, icon, category, terminal, appdir, version, comment, bundle, log, cancel, bwrap)
+        ident = make_appdir(src, name, exe, icon, category, terminal, appdir, version, comment, bundle, log, cancel, bwrap, data)
         arch = platform.machine()
         stem = f"{ident}-{clean(version)}-{arch}" if version else f"{ident}-{arch}"
         built = f"{tmp}/{stem}.AppImage"
@@ -53,7 +53,7 @@ def describe_run(code, text, timed_out, seconds, sandboxed):
     return "\n".join(lines) + (f"\n\nOutput:\n{tail}" if tail else "")
 
 
-def try_run(src, name, exe, icon, category, terminal, sandbox=False, seconds=5, log=None, cancel=None, bundle=False):
+def try_run(src, name, exe, icon, category, terminal, sandbox=False, seconds=5, log=None, cancel=None, bundle=False, data=None):
     """Start the packed program the way the AppImage would and watch it for a few seconds (inside bubblewrap, with no
     network and your home hidden but your screen shared, when sandbox is on). Returns (ok, a description); ok means it ran fine or was still
     running when the time was up. It catches a wrong program, a missing library or a format error before you build."""
@@ -61,7 +61,7 @@ def try_run(src, name, exe, icon, category, terminal, sandbox=False, seconds=5, 
     with tempfile.TemporaryDirectory(prefix="satchel-try-") as tmp:
         tmp = os.path.realpath(tmp)
         appdir = f"{tmp}/AppDir"
-        make_appdir(src, name, exe, icon, category, terminal, appdir, "", "", bundle, log, cancel, bwrap)   # the same checks as a build
+        make_appdir(src, name, exe, icon, category, terminal, appdir, "", "", bundle, log, cancel, bwrap, data)   # the same checks as a build
         cmd = [f"{appdir}/AppRun"]
         if bwrap: cmd = bwrap_base(bwrap, (), tmp, platform.machine(), os.path.realpath(os.path.expanduser("~")), False, display=True) + cmd
         code, text, timed_out = run_streaming(cmd, os.environ, tmp, log, cancel, seconds, False, own_group=not bwrap)

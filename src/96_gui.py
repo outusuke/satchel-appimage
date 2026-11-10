@@ -73,7 +73,13 @@ def run_gui():
             if self.saved.get("category"): self.cat_row.set_selected(CATEGORIES.index(self.saved["category"]))
             self.term_row = Adw.SwitchRow(title="Runs in a terminal", active=self.saved.get("terminal", False))
             self.bundle_row = Adw.SwitchRow(title="Bundle libraries (linuxdeploy)", active=False, sensitive=False)
-            for r in (self.name_row, self.ver_row, self.comment_row, self.icon_row, self.cat_row, self.term_row, self.bundle_row): g.add(r)
+            self.data_row = Adw.SwitchRow(title="Writable data folder", active=False,
+                                          subtitle="For programs that save files next to themselves (an AppImage is read-only): "
+                                                   "it starts in ~/.local/share/<name>, with the packed files linked in")
+            self.writ_row = Adw.EntryRow(title="Also copy these, not link (optional, comma-separated)", visible=False)
+            self.data_row.connect("notify::active", lambda *_: self.writ_row.set_visible(self.data_row.get_active()))
+            for r in (self.name_row, self.ver_row, self.comment_row, self.icon_row, self.cat_row, self.term_row, self.bundle_row,
+                      self.data_row, self.writ_row): g.add(r)
             page.add(g)
 
             g = Adw.PreferencesGroup(title="Result")
@@ -261,6 +267,11 @@ def run_gui():
                 self.set_source(f.get_path())
             (dlg.select_folder if folder else dlg.open)(self, None, done)
 
+        def data_arg(self):
+            """None when the writable data folder is off, else the extra names to copy."""
+            if not self.data_row.get_active(): return None
+            return [n.strip() for n in self.writ_row.get_text().split(",") if n.strip()]
+
         def bundling(self):
             return self.bundle_row.get_active() and self.bundle_row.get_sensitive()
 
@@ -368,12 +379,12 @@ def run_gui():
             self.cancel_ev = cancel = threading.Event()
             args = (self.src, self.name_row.get_text(), exe, self.icon, CATEGORIES[self.cat_row.get_selected()],
                     self.term_row.get_active(), self.out_dir, None, sandbox, self.ver_row.get_text(), self.log_line, cancel,
-                    self.comment_row.get_text(), self.bundling())
+                    self.comment_row.get_text(), self.bundling(), self.data_arg())
             self.save()
             self.show_log(); self.try_btn.set_sensitive(False); self.prev_btn.set_sensitive(False); self.tool_group.set_sensitive(False)
             self.go.set_label("Cancel"); self.go.remove_css_class("suggested-action"); self.go.add_css_class("destructive-action")
             def work():
-                note = packing_notes(self.src, exe, args[-1])
+                note = packing_notes(self.src, exe, self.bundling())
                 try: res = (build(*args), None, False)
                 except Cancelled: res = (None, None, True)
                 except BuildError as e: res = (None, str(e), False)
@@ -393,7 +404,7 @@ def run_gui():
             exe = self.exes[self.exe_row.get_selected()] if self.exes else ""
             sandbox = self.box_row.get_active() and self.box_row.get_visible()
             args = (self.src, self.name_row.get_text(), exe, self.icon, CATEGORIES[self.cat_row.get_selected()],
-                    self.term_row.get_active(), sandbox, 5, self.log_line, None, self.bundling())
+                    self.term_row.get_active(), sandbox, 5, self.log_line, None, self.bundling(), self.data_arg())
             self.save()
             self.show_log(); self.try_btn.set_sensitive(False); self.go.set_sensitive(False); self.prev_btn.set_sensitive(False)
             self.tool_group.set_sensitive(False); self.try_btn.set_label("Trying…")
@@ -407,7 +418,7 @@ def run_gui():
             if not self.src: return self.alert("Nothing to preview", "Choose a program file or folder first.")
             exe = self.exes[self.exe_row.get_selected()] if self.exes else ""
             try: ident, desktop, apprun = preview(self.src, self.name_row.get_text(), exe, self.icon, CATEGORIES[self.cat_row.get_selected()],
-                                                  self.term_row.get_active(), self.ver_row.get_text(), self.comment_row.get_text(), self.bundling())
+                                                  self.term_row.get_active(), self.ver_row.get_text(), self.comment_row.get_text(), self.bundling(), self.data_arg())
             except BuildError as e: return self.alert("Can't preview it", str(e))
             self.alert("Files that will be made", f"{ident}.desktop\n{desktop}\nAppRun\n{apprun}")
 

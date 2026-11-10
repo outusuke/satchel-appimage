@@ -28,13 +28,23 @@ into the package. For a plain archive the program and icon are found inside it l
 ## Command line
 
     satchel PROGRAM [--name N] [--exe E] [--icon I] [--category C] [--version V] [--comment T]
-                         [--terminal] [--bundle-libs] [--out DIR] [--sandbox] [--try [--seconds S]] [--dry-run] [-v]
+                         [--terminal] [--bundle-libs]
+                         [--writable-data [--writable NAME]...] [--out DIR] [--sandbox] [--try [--seconds S]] [--dry-run] [-v]
 
 If you give a folder and no icon, the most likely one inside it is used (it follows the `Icon=` line of a `.desktop` file there, then the file and folder names, then the size). In the window, when a folder holds several programs, the one named like the folder is chosen to start first.
 
 A program, or a folder it sits in, that is a symbolic link leading outside the packed folder is refused, since the link would not be packed.
 
 `--dry-run` prints the files that would be made and builds nothing. `--try` only starts the program to see that it works.
+
+## Programs that write next to themselves
+
+An AppImage is read-only, so a program that reads `translations/` and saves `settings.json` in its own folder fails. Switch on
+**Writable data folder** (`--writable-data`) and `AppRun` starts the program in `~/.local/share/<name>` (or `$XDG_DATA_HOME/<name>`).
+Each time it starts, every item of the packed folder is linked into that folder, so the program sees its files and they follow app updates.
+Small settings-like files (`.json`, `.ini`, `.conf`, `.toml`, `.yaml`, `.xml`, under 64 KB) are copied once and then left alone, so the
+program can change them. For anything else that must be writable, such as a folder the program downloads into, add it with
+`--writable NAME` (the window has a box for it); it is copied once instead of linked. `--dry-run` shows the exact `AppRun`.
 
 ## The sandbox
 
