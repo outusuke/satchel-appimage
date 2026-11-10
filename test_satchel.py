@@ -691,6 +691,58 @@ class Logic(unittest.TestCase):
         with self.assertRaisesRegex(BuildError, "not a .deb"): M["unpack_package"](f"{self.t}/no.deb", f"{self.t}/r2")
         with self.assertRaisesRegex(BuildError, "Only .deb"): M["unpack_package"](f"{self.t}/x.rpm", f"{self.t}/r3")
 
+    def zip_with_links(self, path, links):
+        with zipfile.ZipFile(path, "w") as zf:
+            for name, target in links:
+                zi = zipfile.ZipInfo(name); zi.external_attr = (stat.S_IFLNK | 0o777) << 16; zf.writestr(zi, target)
+        return path
+
+    def assert_nothing_leads_out(self, root):
+        base = os.path.realpath(root)
+        for n in os.listdir(root):
+            real = os.path.realpath(f"{root}/{n}")
+            self.assertTrue(real == base or real.startswith(base + os.sep), f"{n} leads to {real}")
+        self.assertEqual(M["outside_links"](root), [])
+
+    def test_symbolic_link_chains_cannot_lead_out_of_the_unpacked_folder(self):
+        chain = (("x", "."), ("y", "x/.."), ("z", "y/.."), ("w", "z/.."))            # each one climbs a level, all look inside
+        late = (("a", "b/.."), ("b", "."))                                           # a is fine until b is made
+        for n, links in (("chain", chain), ("late", late)):
+            tarp = f"{self.t}/{n}.tar"
+            with tarfile.open(tarp, "w") as tf:
+                for name, tgt in links:
+                    ti = tarfile.TarInfo(name); ti.type, ti.linkname = tarfile.SYMTYPE, tgt; tf.addfile(ti)
+            M["extract_tar"](tarp, f"{self.t}/t-{n}/a/root"); self.assert_nothing_leads_out(f"{self.t}/t-{n}/a/root")
+            M["extract_zip"](self.zip_with_links(f"{self.t}/{n}.zip", links), f"{self.t}/z-{n}/a/root")
+            self.assert_nothing_leads_out(f"{self.t}/z-{n}/a/root")
+        self.assertFalse(os.path.lexists(f"{self.t}/t-late/a/root/a"))               # the one that led out is gone
+        self.assertTrue(os.path.islink(f"{self.t}/t-late/a/root/b"))                 # the harmless one stays
+
+    def test_archives_with_too_many_entries_or_oversized_links_are_refused(self):
+        old = M["MAX_ENTRIES"]; M["MAX_ENTRIES"] = 3
+        try:
+            arc = self.make_tar(f"{self.t}/many.tar", {f"d/f{i}": b"x" for i in range(5)}, "w")
+            with self.assertRaisesRegex(BuildError, "more than"): M["extract_tar"](arc, f"{self.t}/m1")
+            zp = f"{self.t}/many.zip"
+            with zipfile.ZipFile(zp, "w") as zf:
+                for i in range(5): zf.writestr(f"d/f{i}", "x")
+            with self.assertRaisesRegex(BuildError, "more than"): M["extract_zip"](zp, f"{self.t}/m2")
+        finally: M["MAX_ENTRIES"] = old
+        zp = self.zip_with_links(f"{self.t}/biglink.zip", [("big", "a" * (M["MAX_LINK"] + 1)), ("ok", "data")])
+        with zipfile.ZipFile(zp, "a") as zf: zf.writestr("data", "x")
+        M["extract_zip"](zp, f"{self.t}/m3")
+        self.assertFalse(os.path.lexists(f"{self.t}/m3/big")); self.assertTrue(os.path.islink(f"{self.t}/m3/ok"))
+
+    def test_cli_warns_when_it_would_run_a_package_without_the_sandbox(self):
+        deb = self.sample_deb()
+        def run(*extra):
+            err = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err): M["cli"]([deb, *extra])
+            return err.getvalue()
+        self.assertIn("without the sandbox", run("--try", "--seconds", "2"))
+        self.assertNotIn("without the sandbox", run("--bundle-libs", "--dry-run"))
+        self.assertNotIn("without the sandbox", run("--dry-run"))
+
     def test_package_layout_apprun_and_preview(self):
         root = f"{self.t}/root"; M["unpack_package"](self.sample_deb(), root)
         ident, desktop, apprun = M["preview"](root, "Fox Browser", "usr/bin/fox", None, "Network", False)

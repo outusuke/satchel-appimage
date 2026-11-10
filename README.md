@@ -36,6 +36,13 @@ A program, or a folder it sits in, that is a symbolic link leading outside the p
 
 `--dry-run` prints the files that would be made and builds nothing. `--try` only starts the program to see that it works.
 
+## The sandbox
+
+`--sandbox` (the switch in the window) hides your home folder and, once a runtime file is set, the network. It is a convenience, not a security
+boundary: the rest of the system stays readable, there is no system-call filter, and a test run shares your screen (on X11 a program can see
+your keystrokes). Do not run programs you do not trust. Unpacking limits: an archive with more than 500,000 entries is refused, and symbolic
+links that lead out of the unpacked folder are removed.
+
 ## Development
 
 `satchel` is built from the fragments in `src/` (named `NN_name.py`, joined in name order; a fragment may only use names from its own or a lower-numbered one).

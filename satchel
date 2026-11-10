@@ -431,6 +431,8 @@ PKG_EXT = (".deb",) + ARCHIVE_EXT                  # a .pkg.tar.zst (Arch) is an
 
 
 MAX_UNPACKED = 8 << 30
+MAX_ENTRIES = 500000                               # most files, folders and links an unpacked package or archive may hold
+MAX_LINK = 4096                                    # longest symbolic link target read from a .zip
 
 
 CATEGORY_MAP = {"Utility": "Utility", "TextEditor": "Utility", "Development": "Development", "IDE": "Development",
@@ -492,15 +494,34 @@ def _tar_ready(raw, name, work):
     return zstd_unpack(raw, f"{work}/data.tar")
 
 
+def drop_escaping_links(base):
+    """Remove every symbolic link under base that does not lead to a place inside base. A link is checked when it is made,
+    but a later link can change where an earlier one leads (a -> b/.. is fine until b becomes a link to the folder itself),
+    so the whole tree is checked again once everything is unpacked, until nothing more is removed."""
+    base = os.path.realpath(base)
+    for _ in range(64):
+        gone = 0
+        for root, dirs, files in os.walk(base):
+            for n in dirs + files:
+                p = os.path.join(root, n)
+                if outside_link(p, base): os.remove(p); gone += 1
+            dirs[:] = [d for d in dirs if os.path.isdir(os.path.join(root, d)) and not os.path.islink(os.path.join(root, d))]
+        if not gone: return
+    raise BuildError("The package has too many symbolic links that lead into each other, so it was not unpacked.")
+
+
 def extract_tar(tar_path, dest):
     """Unpack a tar into dest safely: nothing is written outside dest (no .., no writing through links), absolute
-    links are rewritten to point inside dest, device files and the like are skipped, and the total size is limited."""
-    base, total = os.path.realpath(dest), 0
+    links are rewritten to point inside dest and every link is checked again after unpacking, device files and the like
+    are skipped, and the total size and the number of entries are limited."""
+    base, total, count = os.path.realpath(dest), 0, 0
     inside = lambda p: p == base or p.startswith(base + os.sep)
     os.makedirs(base, exist_ok=True)
     try:
         with tarfile.open(tar_path, "r:*") as tar:
             for m in tar:
+                count += 1
+                if count > MAX_ENTRIES: raise BuildError(f"The package holds more than {MAX_ENTRIES:,} entries, so it was not unpacked.")
                 parts = [x for x in m.name.split("/") if x not in ("", ".")]
                 if not parts or ".." in parts: continue
                 target = os.path.join(base, *parts)
@@ -520,7 +541,7 @@ def extract_tar(tar_path, dest):
                 elif m.issym():
                     link = m.linkname
                     if os.path.isabs(link): link = os.path.relpath(os.path.join(base, link.lstrip("/")), parent)
-                    if not inside(os.path.normpath(os.path.join(parent, link))): continue
+                    if not inside(os.path.realpath(os.path.join(parent, link))): continue
                     if os.path.lexists(target): os.remove(target)
                     os.symlink(link, target)
                 elif m.islnk():
@@ -528,6 +549,7 @@ def extract_tar(tar_path, dest):
                     if inside(os.path.realpath(srcp)) and os.path.isfile(srcp):
                         if os.path.lexists(target): os.remove(target)
                         shutil.copy2(srcp, target)
+        drop_escaping_links(base)
     except BuildError: raise
     except Exception as e: raise BuildError(f"Could not unpack the package: {e}")
 
@@ -555,13 +577,16 @@ def unpack_deb(path, dest):
 
 def extract_zip(zip_path, dest):
     """Unpack a .zip into dest with the same safety rules as extract_tar (nothing outside dest, links kept only when
-    they stay inside, size limited). The program's executable bit is kept."""
+    they stay inside and are checked again after unpacking, size and number of entries limited). The program's
+    executable bit is kept."""
     base, total = os.path.realpath(dest), 0
     inside = lambda p: p == base or p.startswith(base + os.sep)
     os.makedirs(base, exist_ok=True)
     try:
         with zipfile.ZipFile(zip_path) as zf:
-            for zi in zf.infolist():
+            infos = zf.infolist()
+            if len(infos) > MAX_ENTRIES: raise BuildError(f"The archive holds more than {MAX_ENTRIES:,} entries, so it was not unpacked.")
+            for zi in infos:
                 parts = [x for x in zi.filename.replace("\\", "/").split("/") if x not in ("", ".")]
                 if not parts or ".." in parts: continue
                 target = os.path.join(base, *parts); parent = os.path.dirname(target)
@@ -571,10 +596,11 @@ def extract_zip(zip_path, dest):
                     if not os.path.islink(target): os.makedirs(target, exist_ok=True); os.chmod(target, (mode & 0o777) | 0o700)
                     continue
                 os.makedirs(parent, exist_ok=True)
-                if stat.S_ISLNK(mode):
+                if stat.S_ISLNK(zi.external_attr >> 16):               # the file type bits are in mode's upper part, which & 0o7777 cut off
+                    if zi.file_size > MAX_LINK: continue
                     link = zf.read(zi).decode("utf-8", "replace")
                     if os.path.isabs(link): link = os.path.relpath(os.path.join(base, link.lstrip("/")), parent)
-                    if not inside(os.path.normpath(os.path.join(parent, link))): continue
+                    if not inside(os.path.realpath(os.path.join(parent, link))): continue
                     if os.path.lexists(target): os.remove(target)
                     os.symlink(link, target)
                     continue
@@ -587,6 +613,7 @@ def extract_zip(zip_path, dest):
                         if total > MAX_UNPACKED: raise BuildError("The archive is unpacked larger than 8 GB, so it was not unpacked.")
                         out.write(chunk)
                 os.chmod(target, ((mode & 0o777) or 0o644) | 0o600)
+        drop_escaping_links(base)
     except BuildError: raise
     except Exception as e: raise BuildError(f"Could not unpack the archive: {e}")
 
@@ -1193,6 +1220,9 @@ def cli(argv):
         a.category, a.terminal = a.category or info["category"] or "Utility", a.terminal or info["terminal"]
         print(f"From the package or archive: program {a.exe}, name {a.name}" + (f", icon {os.path.relpath(a.icon, root)}" if a.icon else ""),
               file=sys.stderr)
+        if (a.try_first or a.bundle_libs) and not a.dry_run and not a.sandbox:
+            print("Heads up: --try and --bundle-libs run programs from this package on your computer without the sandbox. "
+                  "Add --sandbox unless you trust it.", file=sys.stderr)
         a.source = root
         return cli_run(a)
 
@@ -1305,7 +1335,7 @@ def run_gui():
             g.add(self.ld_row)
             self.tool_group = g
             self.box_row = Adw.SwitchRow(title="Run it in a bubblewrap sandbox", active=self.saved.get("sandbox", True), visible=bool(shutil.which("bwrap")),
-                                         subtitle="Hides your home folder. No network once a runtime file is set")
+                                         subtitle="Hides your home folder. No network once a runtime file is set. Your screen is still shared")
             g.add(self.box_row); page.add(g)
 
             g = Adw.PreferencesGroup(title="Program", description="What goes inside the AppImage.")

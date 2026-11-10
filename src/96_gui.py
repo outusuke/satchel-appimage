@@ -52,7 +52,7 @@ def run_gui():
             g.add(self.ld_row)
             self.tool_group = g
             self.box_row = Adw.SwitchRow(title="Run it in a bubblewrap sandbox", active=self.saved.get("sandbox", True), visible=bool(shutil.which("bwrap")),
-                                         subtitle="Hides your home folder. No network once a runtime file is set")
+                                         subtitle="Hides your home folder. No network once a runtime file is set. Your screen is still shared")
             g.add(self.box_row); page.add(g)
 
             g = Adw.PreferencesGroup(title="Program", description="What goes inside the AppImage.")

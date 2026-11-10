@@ -38,6 +38,9 @@ def cli(argv):
         a.category, a.terminal = a.category or info["category"] or "Utility", a.terminal or info["terminal"]
         print(f"From the package or archive: program {a.exe}, name {a.name}" + (f", icon {os.path.relpath(a.icon, root)}" if a.icon else ""),
               file=sys.stderr)
+        if (a.try_first or a.bundle_libs) and not a.dry_run and not a.sandbox:
+            print("Heads up: --try and --bundle-libs run programs from this package on your computer without the sandbox. "
+                  "Add --sandbox unless you trust it.", file=sys.stderr)
         a.source = root
         return cli_run(a)
 
