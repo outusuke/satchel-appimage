@@ -13,9 +13,11 @@ def cli(argv):
     p.add_argument("--bundle-libs", action="store_true", help="copy the libraries the program needs into the AppImage (needs linuxdeploy)")
     p.add_argument("--writable-data", action="store_true",
                    help="for programs that read and write files next to themselves: AppRun works from ~/.local/share/<name>, "
-                        "with the packed files linked in (small files such as settings.json are copied, so they can change)")
+                        "which has the same folders as the program folder (real, so the program can add files anywhere) holding links "
+                        "to the packed files; small files such as settings.json are copied, so they can change")
     p.add_argument("--writable", action="append", default=[], metavar="NAME",
-                   help="with --writable-data: also copy this file or folder (top level of the program folder) instead of linking it; repeatable")
+                   help="with --writable-data, only if needed: copy this file or folder (a path inside the program folder) instead of linking it, "
+                        "for a program that changes a big file in place; repeatable")
     p.add_argument("--out", default=".", help="folder for the result (default: here)")
     p.add_argument("--sandbox", action="store_true", help="run appimagetool (or the test run) inside bubblewrap")
     p.add_argument("--try", dest="try_first", action="store_true",

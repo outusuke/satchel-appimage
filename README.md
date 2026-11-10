@@ -39,12 +39,19 @@ A program, or a folder it sits in, that is a symbolic link leading outside the p
 
 ## Programs that write next to themselves
 
-An AppImage is read-only, so a program that reads `translations/` and saves `settings.json` in its own folder fails. Switch on
-**Writable data folder** (`--writable-data`) and `AppRun` starts the program in `~/.local/share/<name>` (or `$XDG_DATA_HOME/<name>`).
-Each time it starts, every item of the packed folder is linked into that folder, so the program sees its files and they follow app updates.
-Small settings-like files (`.json`, `.ini`, `.conf`, `.toml`, `.yaml`, `.xml`, under 64 KB) are copied once and then left alone, so the
-program can change them. For anything else that must be writable, such as a folder the program downloads into, add it with
-`--writable NAME` (the window has a box for it); it is copied once instead of linked. `--dry-run` shows the exact `AppRun`.
+An AppImage is read-only, so a program that reads `translations/` and saves `settings.json` or downloads files into its own folder fails.
+Switch on **Writable data folder** (`--writable-data`) and `AppRun` starts the program in `~/.local/share/<name>` (or `$XDG_DATA_HOME/<name>`).
+Nothing has to be set up for the program. Each time it starts, `AppRun` rebuilds the packed folder's tree there: every folder is a real
+folder and every file is a link to the packed file. The program sees all its files (they follow app updates) and can create files and
+folders anywhere, such as downloads, caches or saves. Small settings-like files (`.json`, `.ini`, `.conf`, `.toml`, `.yaml`, `.xml`, under 64 KB)
+are copied once, at any depth, and then left alone so the program can change them. Files the program made are never touched. Links left by an
+earlier start, including whole-folder links from an older Satchel, are replaced. If the data folder cannot be written (for example a sandbox
+that keeps `~/.local/share` read-only), `AppRun` says so and stops.
+
+Only one copy of such an app should run at a time: starting a second one relinks the files to its own mount.
+A program that changes a big existing file in place cannot do it through a link. For that rare case list the file or folder with
+`--writable PATH` (the window has a box for it); it is copied once instead of linked. `--dry-run` shows the exact `AppRun`.
+`AppRun` uses `cp -rs` and `find` from coreutils and findutils.
 
 ## The sandbox
 

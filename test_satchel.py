@@ -774,27 +774,61 @@ class Logic(unittest.TestCase):
         err = io.StringIO()
         with contextlib.redirect_stderr(err): self.assertEqual(M["cli"]([f"{self.t}/no.deb", "--dry-run"]), 1)
 
-    def test_writable_data_folder_links_packed_files_and_copies_settings(self):
+    def test_writable_data_folder_rebuilds_the_tree_so_any_program_can_add_files(self):
         d = f"{self.t}/prog"; os.makedirs(f"{d}/translations/en"); os.makedirs(f"{d}/puzzles")
-        put(f"{d}/translations/en/a.ftl", "hello"); put(f"{d}/settings.json", "{}"); put(f"{d}/puzzles/info.txt", "i"); put(f"{d}/big.dat", "x" * 70000)
-        script(f"{d}/run", 'pwd; cat translations/en/a.ftl; echo; echo new > settings.json; echo db > puzzles/db.csv\n')
-        os.chmod(f"{d}/puzzles", 0o555)                                           # like a read-only image: copies must still be writable
-        self.assertEqual(M["data_copies"](d, "run"), ["settings.json"])           # small plain files only: not the program, not big data
-        self.assertEqual(M["data_copies"](d, "run", ["puzzles", "puzzles/x"]), ["puzzles", "settings.json"])
+        put(f"{d}/translations/en/a.ftl", "hello"); put(f"{d}/settings.json", "{}"); put(f"{d}/translations/en/meta.json", "{}"); put(f"{d}/puzzles/info.txt", "i"); put(f"{d}/big.dat", "x" * 70000)
+        script(f"{d}/run", 'pwd; cat translations/en/a.ftl; echo; echo new > settings.json; echo db > puzzles/db.csv; echo n > translations/en/b.ftl; echo c > cache.bin; mkdir saves && echo s > saves/1\n')
+        for sub in ("puzzles", "translations/en", "translations"): os.chmod(f"{d}/{sub}", 0o555)   # like a read-only image: the data folders must still be writable
+        self.assertEqual(M["data_copies"](d, "run"), [])                           # nothing has to be named
+        self.assertEqual(M["data_copies"](d, "run", ["puzzles/x", "./big.dat", "../out", "/abs", " "]), ["big.dat", "puzzles/x"])
         home = f"{self.t}/home"; os.makedirs(home); env = {**os.environ, "HOME": home}; env.pop("XDG_DATA_HOME", None)
-        ad = f"{self.t}/AD"; M["make_appdir"](d, "My App", "run", None, "Utility", False, ad, data=["puzzles"])
+        ad = f"{self.t}/AD"; M["make_appdir"](d, "My App", "run", None, "Utility", False, ad, data=[])
         r = subprocess.run([f"{ad}/AppRun"], capture_output=True, text=True, env=env)
         data = f"{home}/.local/share/My_App"
         self.assertEqual(r.stdout.split("\n")[:2], [data, "hello"], r.stderr)    # starts in the data folder and sees the packed files
-        self.assertTrue(os.path.islink(f"{data}/translations")); self.assertTrue(os.path.islink(f"{data}/run"))
-        self.assertFalse(os.path.islink(f"{data}/settings.json")); self.assertEqual(get(f"{data}/settings.json").strip(), "new")
-        self.assertEqual(get(f"{data}/puzzles/db.csv").strip(), "db")
+        for folder in ("translations", "translations/en", "puzzles"):             # folders are real, so new files can go in them
+            self.assertTrue(os.path.isdir(f"{data}/{folder}") and not os.path.islink(f"{data}/{folder}"), folder)
+        self.assertTrue(os.path.islink(f"{data}/run")); self.assertTrue(os.path.islink(f"{data}/translations/en/a.ftl")); self.assertTrue(os.path.islink(f"{data}/big.dat"))
+        for f in ("settings.json", "translations/en/meta.json"): self.assertFalse(os.path.islink(f"{data}/{f}"), f)   # small settings-like files, at any depth, are copies
+        self.assertEqual(get(f"{data}/settings.json").strip(), "new")
+        self.assertEqual(get(f"{data}/puzzles/db.csv").strip(), "db"); self.assertEqual(get(f"{data}/translations/en/b.ftl").strip(), "n")
+        self.assertEqual(get(f"{data}/cache.bin").strip(), "c"); self.assertEqual(get(f"{data}/saves/1").strip(), "s")
         ad2 = f"{self.t}/AD2"; shutil.move(ad, ad2)                                # the next start is mounted somewhere else
-        os.chmod(f"{d}/puzzles", 0o755); shutil.rmtree(d)                          # the old links now dangle
-        self.assertFalse(os.path.exists(f"{data}/translations"))
+        for sub in ("puzzles", "translations/en", "translations"): os.chmod(f"{d}/{sub}", 0o755)
+        shutil.rmtree(d)                                                           # the old links now dangle
+        self.assertFalse(os.path.exists(f"{data}/translations/en/a.ftl")); self.assertTrue(os.path.islink(f"{data}/translations/en/a.ftl"))
         r = subprocess.run([f"{ad2}/AppRun"], capture_output=True, text=True, env=env)
         self.assertEqual(r.stdout.split("\n")[1], "hello", r.stderr)              # relinked
-        self.assertEqual(get(f"{data}/settings.json").strip(), "new")              # the program's change was kept, not overwritten
+        self.assertEqual(get(f"{data}/settings.json").strip(), "new")              # the program's changes were kept, not overwritten
+        self.assertEqual(get(f"{data}/puzzles/db.csv").strip(), "db")
+        self.assertEqual(get(f"{data}/translations/en/b.ftl").strip(), "n")
+
+    def test_writable_data_replaces_folder_links_left_by_an_older_apprun(self):
+        d = f"{self.t}/prog"; os.makedirs(f"{d}/puzzles"); put(f"{d}/puzzles/info.txt", "i")
+        script(f"{d}/run", 'echo db > puzzles/db.csv; cat puzzles/info.txt\n')
+        home = f"{self.t}/home"; data = f"{home}/.local/share/My_App"; os.makedirs(data)
+        env = {**os.environ, "HOME": home}; env.pop("XDG_DATA_HOME", None)
+        ad = f"{self.t}/AD"; M["make_appdir"](d, "My App", "run", None, "Utility", False, ad, data=[])
+        old = f"{self.t}/oldmount/usr/lib/My_App"; os.makedirs(f"{old}/puzzles")  # what the old design left: a link to a folder of a previous mount
+        os.symlink(f"{old}/puzzles", f"{data}/puzzles"); os.symlink(f"{old}/gone", f"{data}/gone")
+        os.symlink("/etc/hostname", f"{data}/mine")                                # a link the program made itself is not ours to remove
+        r = subprocess.run([f"{ad}/AppRun"], capture_output=True, text=True, env=env)
+        self.assertEqual(r.stdout.strip(), "i", r.stderr)
+        self.assertTrue(os.path.isdir(f"{data}/puzzles") and not os.path.islink(f"{data}/puzzles"))
+        self.assertEqual(get(f"{data}/puzzles/db.csv").strip(), "db")
+        self.assertFalse(os.path.lexists(f"{data}/gone")); self.assertTrue(os.path.islink(f"{data}/mine"))
+
+    def test_writable_data_copies_a_named_big_file_once_and_says_when_the_data_folder_cannot_be_written(self):
+        d = f"{self.t}/prog"; os.makedirs(f"{d}/db"); put(f"{d}/db/big.dat", "x" * 70000)
+        script(f"{d}/run", 'echo more >> db/big.dat; wc -c < db/big.dat\n')
+        home = f"{self.t}/home"; os.makedirs(home); env = {**os.environ, "HOME": home}; env.pop("XDG_DATA_HOME", None)
+        ad = f"{self.t}/AD"; M["make_appdir"](d, "My App", "run", None, "Utility", False, ad, data=["db/big.dat"])
+        os.chmod(f"{ad}/usr/lib/My_App/db/big.dat", 0o444)
+        for _ in range(2):
+            r = subprocess.run([f"{ad}/AppRun"], capture_output=True, text=True, env=env)
+        self.assertEqual(r.stdout.strip(), str(70000 + 10), r.stderr)              # changed in place, and the change survived the second start
+        r = subprocess.run([f"{ad}/AppRun"], capture_output=True, text=True, env={**env, "XDG_DATA_HOME": "/proc/no-such-place"})
+        self.assertEqual(r.returncode, 1); self.assertIn("Cannot write to /proc/no-such-place/My_App", r.stderr)   # said plainly, not a silent failure
 
     def test_writable_data_is_off_by_default_and_shown_in_the_preview(self):
         d = self.prog_folder()

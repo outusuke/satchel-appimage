@@ -72,29 +72,28 @@ def usr_layout(src, exe):
             and os.path.normpath(exe or "").replace(os.sep, "/").startswith(("usr/", "opt/")))
 
 
-DATA_COPY_MAX = 64 * 1024       # a settings-like file this small, next to the program, is copied, not linked
+DATA_COPY_MAX = 64 * 1024       # a settings-like file this small, anywhere in the program folder, is copied, not linked
 DATA_COPY_EXT = (".json", ".ini", ".cfg", ".conf", ".toml", ".yaml", ".yml", ".xml", ".properties")
 
 
 def data_copies(src, exe, extra=()):
-    """Names (in the packed folder's top level) that a writable-data AppRun copies into the data folder instead of linking:
-    small settings-like files (settings.json, *.ini, *.conf, …), plus anything the person listed in extra."""
-    names = {os.path.normpath(n).split(os.sep)[0] for n in extra if n.strip()}
-    if os.path.isdir(src):
-        for n in os.listdir(src):
-            p = os.path.join(src, n)
-            if os.path.isfile(p) and not os.path.islink(p) and os.path.getsize(p) <= DATA_COPY_MAX and n.lower().endswith(DATA_COPY_EXT): names.add(n)
-    names.discard("."); names.discard("..")
-    return sorted(names)
+    """The extra names (paths inside the packed folder, any depth) that a writable-data AppRun copies once instead of
+    linking, for programs that change a big file in place. Nothing is needed for a program that only adds new files:
+    every folder is a real folder in the data folder. Settings-like small files are found by AppRun itself."""
+    out = set()
+    for n in extra:
+        n = os.path.normpath(n.strip()) if n.strip() else ""
+        if n and n != "." and not os.path.isabs(n) and n.split(os.sep)[0] != "..": out.add(n)
+    return sorted(out)
 
 
 def apprun_script(ident, exe, libs, usr=False, bundled=False, data=None):
     """The text of AppRun: it starts the program, with LD_LIBRARY_PATH pointing at the .so folders packed next to it.
     usr (an unpacked package) also puts the package's usr/bin and usr/share on PATH and XDG_DATA_DIRS; bundled adds
     the folder linuxdeploy copied libraries into. data (a list of names, possibly empty; None means off) makes AppRun work from a
-    writable folder, ~/.local/share/<ident>, because an AppImage is read-only: every top-level item of the packed folder is linked
-    into it afresh on each start (the AppImage is mounted somewhere new each time), except the names in data, which are copied
-    once and then left alone so the program can change them."""
+    writable folder, ~/.local/share/<ident>, because an AppImage is read-only: on each start (the AppImage is mounted somewhere
+    new each time) the packed folder's tree is rebuilt there as real folders holding links to the packed files, so the program can
+    create files anywhere. Small settings-like files, and the names in data, are copied once and then left alone so the program can change them."""
     out = '#!/bin/sh\nHERE="$(dirname "$(readlink -f "$0")")"\n'
     if libs or usr or bundled or data is not None: out += f'APP="$HERE"/{shlex.quote(f"usr/lib/{ident}")}\n'
     parts = [('"$APP"' if r == "." else '"$APP"/' + shlex.quote(r)) for r in libs] + (['"$HERE"/usr/lib'] if bundled else [])
@@ -104,10 +103,23 @@ def apprun_script(ident, exe, libs, usr=False, bundled=False, data=None):
         out += ('PATH="$APP"/usr/bin:"$APP"/usr/games"${PATH:+:$PATH}"; export PATH\n'
                 'XDG_DATA_DIRS="$APP"/usr/share:"${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"; export XDG_DATA_DIRS\n')
     if data is not None:
-        arms = ("|".join(shlex.quote(n) for n in data) + ') [ -e "$DATA/$n" ] || { cp -a "$f" "$DATA/$n" && chmod -R u+w "$DATA/$n"; } ;;\n    ') if data else ""
-        out += (f'DATA="${{XDG_DATA_HOME:-$HOME/.local/share}}"/{shlex.quote(ident)}\nmkdir -p "$DATA" || exit 1\n'
-                'for f in "$APP"/* "$APP"/.[!.]*; do\n  [ -e "$f" ] || continue\n  n="${f##*/}"\n  case "$n" in\n'
-                f'    {arms}*) if [ -L "$DATA/$n" ] || [ ! -e "$DATA/$n" ]; then ln -sfn "$f" "$DATA/$n"; fi ;;\n  esac\ndone\n'
+        copy = ""
+        if data:
+            copy = ("for n in " + " ".join(shlex.quote(n) for n in data) + "; do\n"
+                    '  [ -e "$APP/$n" ] || continue\n  [ -e "$DATA/$n" ] || [ -L "$DATA/$n" ] && continue\n'
+                    '  mkdir -p "$(dirname "$DATA/$n")" && cp -a "$APP/$n" "$DATA/$n" && chmod -R u+w "$DATA/$n"\ndone\n')
+        ext = " -o ".join(f"-iname '*{e}'" for e in DATA_COPY_EXT)
+        out += (f'DATA="${{XDG_DATA_HOME:-$HOME/.local/share}}"/{shlex.quote(ident)}\n'
+                'mkdir -p "$DATA" && [ -w "$DATA" ] || { echo "Cannot write to $DATA" >&2; exit 1; }\n'
+                '# 1. drop the links an earlier start made: they point into an AppImage mount that is gone (this also turns a\n'
+                '#    folder link from an older AppRun into a real folder)\n'
+                f"find \"$DATA\" -type l -lname '*/usr/lib/{ident}/*' -delete\n"
+                '# 2. things the person asked to copy (copied once, then left alone)\n' + copy +
+                '# 3. every folder becomes a real folder, every file a link to the packed file; anything already there is kept\n'
+                'for f in "$APP"/* "$APP"/.[!.]*; do\n  [ -e "$f" ] || [ -L "$f" ] || continue\n  cp -rs "$f" "$DATA"/ 2>/dev/null\ndone\n'
+                f'# 4. small settings-like files are copied (once), so the program can change them in place\n'
+                f'find "$APP" -type f \\( {ext} \\) -size -{DATA_COPY_MAX + 1}c -exec sh -c \'A=$1; D=$2; shift 2\n'
+                '  for f; do r=${f#"$A"/}\n    if [ -L "$D/$r" ]; then rm -f "$D/$r" && cp "$f" "$D/$r" && chmod u+w "$D/$r"; fi\n  done\' sh "$APP" "$DATA" {} +\n'
                 'cd "$DATA" || exit 1\n')
     return out + f'exec "$HERE"/{shlex.quote(f"usr/lib/{ident}/{exe}")} "$@"\n'
 
