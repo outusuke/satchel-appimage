@@ -117,6 +117,8 @@ def apprun_script(ident, exe, libs, usr=False, bundled=False, data=None):
                 '# 2. things the person asked to copy (copied once, then left alone)\n' + copy +
                 '# 3. every folder becomes a real folder, every file a link to the packed file; anything already there is kept\n'
                 'for f in "$APP"/* "$APP"/.[!.]*; do\n  [ -e "$f" ] || [ -L "$f" ] || continue\n  cp -rs "$f" "$DATA"/ 2>/dev/null\ndone\n'
+                '#    (the packed folders may be read-only: the real folders made here must let the program add files)\n'
+                'find "$DATA" -type d ! -perm -u+w -exec chmod u+w {} + 2>/dev/null\n'
                 f'# 4. small settings-like files are copied (once), so the program can change them in place\n'
                 f'find "$APP" -type f \\( {ext} \\) -size -{DATA_COPY_MAX + 1}c -exec sh -c \'A=$1; D=$2; shift 2\n'
                 '  for f; do r=${f#"$A"/}\n    if [ -L "$D/$r" ]; then rm -f "$D/$r" && cp "$f" "$D/$r" && chmod u+w "$D/$r"; fi\n  done\' sh "$APP" "$DATA" {} +\n'

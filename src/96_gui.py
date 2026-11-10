@@ -73,17 +73,16 @@ def run_gui():
             if self.saved.get("category"): self.cat_row.set_selected(CATEGORIES.index(self.saved["category"]))
             self.term_row = Adw.SwitchRow(title="Runs in a terminal", active=self.saved.get("terminal", False))
             self.bundle_row = Adw.SwitchRow(title="Bundle libraries (linuxdeploy)", active=False, sensitive=False)
-            self.data_row = Adw.SwitchRow(title="Writable data folder", active=False,
-                                          subtitle="An AppImage is read-only, so a program that saves settings, downloads or other files "
-                                                   "next to itself fails. When this is on, the program starts in an ordinary folder, "
-                                                   "~/.local/share/<app name>, made on the first run. It has the program's own folders, "
-                                                   "with links to the packed files, and the program can create files anywhere in it. "
-                                                   "What it saves stays there after you close the app. Leave this off for programs that "
-                                                   "only read their files.")
-            self.writ_row = Adw.EntryRow(title="Rarely needed: files changed in place, copied not linked (comma-separated)", visible=False,
-                                         tooltip_text="Only for a program that edits a big existing file in place (a database, say). "
-                                                      "Give paths inside the program folder, e.g. data/big.db. They are copied into the data "
-                                                      "folder once instead of linked. Most programs need nothing here.")
+            self.data_row = Adw.SwitchRow(title="Let the program save files (writable data folder)", active=False,
+                                          subtitle="Turn on if the program saves settings, downloads or other files next to itself "
+                                                   "(it fails or loses them otherwise, because an AppImage is read-only). "
+                                                   "It then runs from ~/.local/share/<app name>, where it can write, "
+                                                   "and what it saves stays there. Leave off if it only reads its files.")
+            self.writ_row = Adw.EntryRow(title="Advanced: big files the program edits in place (usually leave empty)", visible=False,
+                                         tooltip_text="Only for a program that changes a large existing file in place, such as a database. "
+                                                      "Paths inside the program folder, separated by commas, e.g. data/big.db. "
+                                                      "Those files are copied to the data folder once instead of linked. "
+                                                      "If the program works without this, leave it empty.")
             self.data_row.connect("notify::active", lambda *_: self.writ_row.set_visible(self.data_row.get_active()))
             for r in (self.name_row, self.ver_row, self.comment_row, self.icon_row, self.cat_row, self.term_row, self.bundle_row,
                       self.data_row, self.writ_row): g.add(r)
