@@ -152,6 +152,19 @@ class Logic(unittest.TestCase):
     def test_find_executables_skips_libs_and_data(self):
         self.assertEqual(M["find_executables"](self.prog_folder()), ["bin/run"])
 
+    def test_a_program_that_lost_its_executable_bit_is_found_and_packed_runnable(self):
+        d = self.prog_folder(); os.chmod(f"{d}/bin/run", 0o644)                        # a copy or an extraction dropped the bit
+        self.assertEqual(M["find_executables"](d), ["bin/run"])
+        ad = f"{self.t}/AD"; M["make_appdir"](d, "x", "bin/run", None, "Utility", False, ad)
+        self.assertTrue(os.access(f"{ad}/usr/lib/x/bin/run", os.X_OK))
+
+    def test_executable_pictures_and_data_are_not_programs(self):
+        d = self.prog_folder(); os.makedirs(f"{d}/pieces/california")                 # some packages mark every file executable
+        svg = f"{d}/pieces/california/bB.svg"; put(svg, '<?xml version="1.0" encoding="UTF-8"?>\n<svg/>'); os.chmod(svg, 0o755)
+        self.assertEqual(M["find_executables"](d), ["bin/run"])
+        self.assertFalse(M["is_program"](svg)); self.assertTrue(M["is_program"](f"{d}/bin/run"))
+        with self.assertRaisesRegex(BuildError, "not a binary or a script"): M["preview"](d, "x", "pieces/california/bB.svg", None, "Utility", False)
+
     def test_folder_appdir_layout_and_apprun_runs(self):
         ad = f"{self.t}/AppDir"
         ident = M["make_appdir"](self.prog_folder(), "My App", "bin/run", None, "Utility", True, ad)

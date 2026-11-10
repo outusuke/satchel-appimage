@@ -36,13 +36,14 @@ def check_inputs(src, name, exe, icon, category, version="", comment=""):
     if os.path.isdir(src):
         exe = os.path.normpath(exe or "")
         if not exe or exe == "." or os.path.isabs(exe) or exe.split(os.sep)[0] == "..": raise BuildError("Choose which program in the folder to start.")
-        if not (os.path.isfile(os.path.join(src, exe)) and os.access(os.path.join(src, exe), os.X_OK)):
-            raise BuildError(f"'{exe}' is not an executable file inside the folder.")
+        if not os.path.isfile(os.path.join(src, exe)): raise BuildError(f"'{exe}' is not an executable file inside the folder.")
         real_exe = os.path.realpath(os.path.join(src, exe))
         if outside_link(os.path.join(src, exe), src) or not real_exe.startswith(src + os.sep):
             raise BuildError(f"'{exe}' is a symbolic link that leads outside the folder, so it would not be packed. Copy the real file into the folder.")
+        if not is_program(os.path.join(src, exe)):
+            raise BuildError(f"'{exe}' is not an executable file (it is not a binary or a script that starts with #!).")
     elif os.path.isfile(src):
-        if not os.access(src, os.X_OK): raise BuildError("That file is not executable (chmod +x it first).")
+        if not is_program(src): raise BuildError("That file is not an executable program (it is not a binary or a script that starts with #!).")
         exe = os.path.basename(src)
     else:
         raise BuildError("Choose the program file or folder to pack.")
@@ -111,6 +112,8 @@ def make_appdir(src, name, exe, icon, category, terminal, appdir, version="", co
         shutil.copytree(src, lib, symlinks=True, dirs_exist_ok=True,
                         ignore=lambda d, names: [n for n in names if outside_link(os.path.join(d, n), src)])
     else: shutil.copy2(src, f"{lib}/{exe}")
+    prog = os.path.join(lib, exe)                   # the packed copy must be startable even if the original lost its bit
+    os.chmod(prog, (os.stat(prog).st_mode & 0o7777) | 0o111)
     if icon: shutil.copy2(icon, f"{appdir}/{ident}{ext}")
     else: placeholder_icon(f"{appdir}/{ident}{ext}")
     shutil.copy2(f"{appdir}/{ident}{ext}", f"{appdir}/.DirIcon")

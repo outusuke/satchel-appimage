@@ -119,16 +119,27 @@ def nested_problem(path):
             "start that instead. Use the file as it is, or unpack it and pack what is inside.")
 
 
+def is_program(path):
+    """True when the file starts like something that can be run: an ELF binary or a script with a #! line. The permission bit
+    is not used: some packages mark every file executable, pictures and data included, and a copy or an extraction can drop
+    the bit from a real program (the build sets it on the program it packs)."""
+    try:
+        with open(path, "rb") as f: head = f.read(4)
+    except OSError:
+        return False
+    return head == b"\x7fELF" or head[:2] == b"#!"
+
+
 def find_executables(folder):
-    """Executable files at most two folders deep, as paths relative to folder (shallowest first, no .so files, no links
-    that lead outside the folder)."""
+    """Programs at most two folders deep, as paths relative to folder (shallowest first): ELF files and #! scripts,
+    no .so files, no links that lead outside the folder."""
     base, out = os.path.realpath(folder), []
     for root, dirs, files in os.walk(base):
         if root[len(base):].count(os.sep) >= 2: dirs[:] = []
         for f in files:
             p = os.path.join(root, f)
             if outside_link(p, base): continue
-            if os.path.isfile(p) and os.access(p, os.X_OK) and not (f.endswith(".so") or ".so." in f):
+            if os.path.isfile(p) and not (f.endswith(".so") or ".so." in f) and is_program(p):
                 out.append(os.path.relpath(p, base))
     return sorted(out, key=lambda r: (r.count(os.sep), r))
 
@@ -1025,13 +1036,14 @@ def check_inputs(src, name, exe, icon, category, version="", comment=""):
     if os.path.isdir(src):
         exe = os.path.normpath(exe or "")
         if not exe or exe == "." or os.path.isabs(exe) or exe.split(os.sep)[0] == "..": raise BuildError("Choose which program in the folder to start.")
-        if not (os.path.isfile(os.path.join(src, exe)) and os.access(os.path.join(src, exe), os.X_OK)):
-            raise BuildError(f"'{exe}' is not an executable file inside the folder.")
+        if not os.path.isfile(os.path.join(src, exe)): raise BuildError(f"'{exe}' is not an executable file inside the folder.")
         real_exe = os.path.realpath(os.path.join(src, exe))
         if outside_link(os.path.join(src, exe), src) or not real_exe.startswith(src + os.sep):
             raise BuildError(f"'{exe}' is a symbolic link that leads outside the folder, so it would not be packed. Copy the real file into the folder.")
+        if not is_program(os.path.join(src, exe)):
+            raise BuildError(f"'{exe}' is not an executable file (it is not a binary or a script that starts with #!).")
     elif os.path.isfile(src):
-        if not os.access(src, os.X_OK): raise BuildError("That file is not executable (chmod +x it first).")
+        if not is_program(src): raise BuildError("That file is not an executable program (it is not a binary or a script that starts with #!).")
         exe = os.path.basename(src)
     else:
         raise BuildError("Choose the program file or folder to pack.")
@@ -1100,6 +1112,8 @@ def make_appdir(src, name, exe, icon, category, terminal, appdir, version="", co
         shutil.copytree(src, lib, symlinks=True, dirs_exist_ok=True,
                         ignore=lambda d, names: [n for n in names if outside_link(os.path.join(d, n), src)])
     else: shutil.copy2(src, f"{lib}/{exe}")
+    prog = os.path.join(lib, exe)                   # the packed copy must be startable even if the original lost its bit
+    os.chmod(prog, (os.stat(prog).st_mode & 0o7777) | 0o111)
     if icon: shutil.copy2(icon, f"{appdir}/{ident}{ext}")
     else: placeholder_icon(f"{appdir}/{ident}{ext}")
     shutil.copy2(f"{appdir}/{ident}{ext}", f"{appdir}/.DirIcon")

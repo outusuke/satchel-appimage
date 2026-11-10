@@ -41,16 +41,27 @@ def nested_problem(path):
             "start that instead. Use the file as it is, or unpack it and pack what is inside.")
 
 
+def is_program(path):
+    """True when the file starts like something that can be run: an ELF binary or a script with a #! line. The permission bit
+    is not used: some packages mark every file executable, pictures and data included, and a copy or an extraction can drop
+    the bit from a real program (the build sets it on the program it packs)."""
+    try:
+        with open(path, "rb") as f: head = f.read(4)
+    except OSError:
+        return False
+    return head == b"\x7fELF" or head[:2] == b"#!"
+
+
 def find_executables(folder):
-    """Executable files at most two folders deep, as paths relative to folder (shallowest first, no .so files, no links
-    that lead outside the folder)."""
+    """Programs at most two folders deep, as paths relative to folder (shallowest first): ELF files and #! scripts,
+    no .so files, no links that lead outside the folder."""
     base, out = os.path.realpath(folder), []
     for root, dirs, files in os.walk(base):
         if root[len(base):].count(os.sep) >= 2: dirs[:] = []
         for f in files:
             p = os.path.join(root, f)
             if outside_link(p, base): continue
-            if os.path.isfile(p) and os.access(p, os.X_OK) and not (f.endswith(".so") or ".so." in f):
+            if os.path.isfile(p) and not (f.endswith(".so") or ".so." in f) and is_program(p):
                 out.append(os.path.relpath(p, base))
     return sorted(out, key=lambda r: (r.count(os.sep), r))
 
