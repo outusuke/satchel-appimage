@@ -18,6 +18,13 @@ Run `satchel`. Drop a program, folder or icon on the window, or use the buttons.
 **Preview files** shows the desktop file and `AppRun` that would be made. **Try it first** starts the program for a few
 seconds. **Ctrl+B** builds.
 
+## Put Satchel in the app menu
+
+The **Satchel** section at the top of the window copies Satchel to `~/.local/bin/satchel` and adds a `satchel.desktop` entry in
+`~/.local/share/applications` that starts that copy (**Add**; **Update** after a new version; **Remove** undoes both).
+On the command line: `satchel --install` and `satchel --uninstall`. If `~/.local/bin` is not in your `PATH` you are told; the menu
+entry works either way.
+
 ## Packages and archives
 
 Drop a `.deb`, an Arch package (`.pkg.tar.zst`), a `.tar.gz` / `.tar.xz` / `.tar.bz2` / `.tar.zst` archive or a `.zip` on the window

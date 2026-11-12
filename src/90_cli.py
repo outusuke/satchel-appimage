@@ -2,7 +2,7 @@ def cli(argv):
     """Build from the command line, no window. Prints the path of the AppImage; returns the exit code."""
     import argparse
     p = argparse.ArgumentParser(prog="satchel", description="Build an AppImage from a program file or folder (no window).")
-    p.add_argument("source", help="the program file, the folder that holds the program, or a .deb package, .tar.* archive or .zip file")
+    p.add_argument("source", nargs="?", help="the program file, the folder that holds the program, or a .deb package, .tar.* archive or .zip file")
     p.add_argument("--name", help="app name (default: the file or folder name)")
     p.add_argument("--exe", default="", help="for a folder: the program to start, relative to the folder")
     p.add_argument("--icon", help="a .png or .svg file (default: the best one found inside the folder)")
@@ -24,8 +24,23 @@ def cli(argv):
                    help="only start the program for a few seconds to see that it works; builds nothing")
     p.add_argument("--seconds", type=float, default=5, help="with --try: how long to watch the program (default 5)")
     p.add_argument("--dry-run", action="store_true", help="only print the .desktop file and AppRun that would be made; builds nothing")
+    p.add_argument("--install", action="store_true", help="copy Satchel to ~/.local/bin and add it to the app menu; builds nothing")
+    p.add_argument("--uninstall", action="store_true", help="remove what --install made")
     p.add_argument("-v", "--verbose", action="store_true", help="show the output while it runs")
     a = p.parse_args(argv)
+    if a.install or a.uninstall:
+        try:
+            if a.install:
+                dest, entry, note = install_self()
+                print(f"Installed {dest}\nMenu entry {entry}" + (f"\n{note}" if note else ""))
+            else:
+                gone = uninstall_self()
+                print("\n".join(f"Removed {g}" for g in gone) or "Nothing was installed.")
+        except BuildError as e:
+            print(e, file=sys.stderr)
+            return 1
+        return 0
+    if not a.source: p.error("the following arguments are required: source")
     if not is_package(a.source):
         a.category = a.category or "Utility"
         return cli_run(a)

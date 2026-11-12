@@ -882,6 +882,31 @@ class Logic(unittest.TestCase):
         self.assertIn("APPIMAGE_EXTRACT_AND_RUN", cmd); self.assertEqual(cmd[cmd.index("--") + 1:][0], os.path.realpath(tool))   # a plain program is run as it is
         self.assertIn(f"{self.t}/work", cmd)                                               # the folder holding the AppDir is writable
 
+    def test_install_self_copies_to_local_bin_and_adds_a_menu_entry(self):
+        src = script(f"{self.t}/satchel-src", "echo hi\n"); b, a = f"{self.t}/h/bin", f"{self.t}/h/apps"
+        dest, entry, note = M["install_self"](src, b, a)
+        self.assertEqual(dest, f"{b}/satchel"); self.assertTrue(os.access(dest, os.X_OK)); self.assertEqual(get(dest), get(src))
+        d = get(entry); self.assertIn(f"Exec={dest}\n", d); self.assertIn("Name=Satchel\n", d); self.assertIn("Categories=Utility;", d)
+        self.assertIn("PATH", note)                                              # the test bin folder is not in PATH
+        put(src, "#!/bin/sh\necho new\n"); M["install_self"](src, b, a); self.assertIn("new", get(dest))     # repeating replaces the copy
+        M["install_self"](dest, b, a); self.assertIn("new", get(dest))          # installing the installed copy keeps it
+        self.assertTrue(M["self_installed"](b, a))
+        self.assertEqual(sorted(M["uninstall_self"](b, a)), sorted([dest, entry]))
+        self.assertEqual(M["uninstall_self"](b, a), []); self.assertFalse(M["self_installed"](b, a))
+        with self.assertRaisesRegex(BuildError, "Cannot find"): M["install_self"](f"{self.t}/nope", b, a)
+
+    def test_install_self_quotes_a_path_with_spaces_in_the_menu_entry(self):
+        src = script(f"{self.t}/s", "exit 0\n"); dest, entry, _ = M["install_self"](src, f"{self.t}/my bin", f"{self.t}/apps")
+        self.assertIn(f'Exec="{dest}"\n', get(entry))
+
+    def test_cli_install_and_uninstall(self):
+        M["SELF_BIN"], M["SELF_APPS"], M["__file__"] = f"{self.t}/b", f"{self.t}/a", script(f"{self.t}/satchel", "exit 0\n")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out): code = M["cli"](["--install"])
+        self.assertEqual(code, 0); self.assertTrue(os.path.isfile(f"{self.t}/a/satchel.desktop")); self.assertIn("Installed", out.getvalue())
+        with contextlib.redirect_stdout(io.StringIO()): self.assertEqual(M["cli"](["--uninstall"]), 0)
+        self.assertFalse(os.path.exists(f"{self.t}/b/satchel"))
+
     def make_tar(self, path, files, mode="w:xz"):
         with tarfile.open(path, mode) as tf:
             for name, val in files.items():
@@ -1084,6 +1109,13 @@ class Window(unittest.TestCase):
     def test_empty_name_is_marked_and_cleared(self):
         self.w.name_row.set_text(""); self.w.name_changed(); self.assertIn("error", self.w.name_row.css)
         self.w.name_row.set_text("x"); self.w.name_changed(); self.assertNotIn("error", self.w.name_row.css)
+
+    def test_the_satchel_row_adds_and_removes_satchel_in_the_menu(self):
+        M["SELF_BIN"], M["SELF_APPS"], M["__file__"] = f"{self.t}/b", f"{self.t}/a", script(f"{self.t}/satchel", "exit 0\n")
+        w = self.w; w.refresh_self(); self.assertEqual(w.self_add.label, "Add"); self.assertFalse(w.self_rm.vis)
+        w.menu_self(True); self.assertTrue(os.path.isfile(f"{self.t}/a/satchel.desktop"))
+        self.assertEqual(w.self_add.label, "Update"); self.assertTrue(w.self_rm.vis)
+        w.menu_self(False); self.assertFalse(os.path.exists(f"{self.t}/b/satchel")); self.assertEqual(w.self_add.label, "Add")
 
     def test_dropping_a_folder_or_an_icon(self):
         class Dropped:

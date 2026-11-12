@@ -7,6 +7,7 @@
 # Usage: satchel                      (opens the window)
 #        satchel PROGRAM [--name N] [--exe E] [--icon I] [--category C] [--version V] [--comment T] [--terminal]
 #                             [--bundle-libs] [--out DIR] [--sandbox] [--try [--seconds S]] [--dry-run] [-v]
+#        satchel --install | --uninstall   (copy to ~/.local/bin and add to / remove from the app menu)
 import collections, glob, hashlib, json, os, platform, re, shlex, shutil, signal, stat, struct, subprocess, sys, tarfile, tempfile, threading, time, unicodedata, zipfile, zlib
 
 
@@ -998,6 +999,59 @@ def prepare_tool(tool):
     return f"{root}/AppRun", root
 
 
+SELF_BIN = os.path.expanduser("~/.local/bin")
+SELF_APPS = os.path.expanduser("~/.local/share/applications")
+
+
+def desktop_exec(path):
+    """A path written the way the Exec= line of a .desktop file wants it (quoted when it holds spaces or shell characters)."""
+    if not re.search(r"[\s\"'\\<>~|&;$*?#()`]", path): return path
+    return '"' + re.sub(r'(["`$\\])', r"\\\1", path).replace("%", "%%") + '"'
+
+
+def install_self(src=None, bin_dir=None, apps_dir=None):
+    """Put Satchel itself in your local binaries (~/.local/bin/satchel) and add it to the app menu (a satchel.desktop file in
+    ~/.local/share/applications that starts that copy). src is the Satchel file to copy (default: the one running). Safe to repeat:
+    it replaces the old copy. Returns (path of the program, path of the menu entry, a note about PATH or '')."""
+    src = src or globals().get("__file__")
+    if not src or not os.path.isfile(src): raise BuildError("Cannot find the Satchel file to install.")
+    bin_dir, apps_dir = bin_dir or SELF_BIN, apps_dir or SELF_APPS
+    dest, entry = f"{bin_dir}/satchel", f"{apps_dir}/satchel.desktop"
+    try:
+        os.makedirs(bin_dir, exist_ok=True); os.makedirs(apps_dir, exist_ok=True)
+        if not (os.path.exists(dest) and os.path.samefile(src, dest)):
+            with open(src, "rb") as f: data = f.read()
+            with open(dest + ".new", "wb") as f: f.write(data)
+            os.chmod(dest + ".new", 0o755); os.replace(dest + ".new", dest)
+        text = ("[Desktop Entry]\nType=Application\nName=Satchel\nComment=Build an AppImage from a program file or folder\n"
+                f"Exec={desktop_exec(dest)}\nIcon=package-x-generic\nCategories=Utility;\nTerminal=false\n")
+        with open(entry + ".new", "w") as f: f.write(text)
+        os.replace(entry + ".new", entry)
+    except OSError as e: raise BuildError(f"Could not install Satchel: {e}")
+    tool = shutil.which("update-desktop-database")
+    if tool:
+        try: subprocess.run([tool, apps_dir], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
+        except (OSError, subprocess.SubprocessError): pass          # only a cache refresh; the menu finds the entry anyway
+    on_path = os.path.realpath(bin_dir) in [os.path.realpath(p) for p in os.environ.get("PATH", "").split(os.pathsep) if p]
+    return dest, entry, "" if on_path else f"Note: {bin_dir} is not in your PATH, so `satchel` will not start from a terminal until you add it."
+
+
+def uninstall_self(bin_dir=None, apps_dir=None):
+    """Remove what install_self made. Returns the paths it removed (empty when nothing was installed)."""
+    bin_dir, apps_dir = bin_dir or SELF_BIN, apps_dir or SELF_APPS
+    gone = []
+    for p in (f"{bin_dir}/satchel", f"{apps_dir}/satchel.desktop"):
+        try: os.remove(p); gone.append(p)
+        except FileNotFoundError: pass
+        except OSError as e: raise BuildError(f"Could not remove {p}: {e}")
+    return gone
+
+
+def self_installed(bin_dir=None, apps_dir=None):
+    """True when Satchel is already in the local binaries with a menu entry (see install_self)."""
+    return os.path.isfile(f"{bin_dir or SELF_BIN}/satchel") and os.path.isfile(f"{apps_dir or SELF_APPS}/satchel.desktop")
+
+
 def bundle_libraries(appdir, ident, exe, log=None, cancel=None, bwrap=None):
     """Run linuxdeploy on the AppDir so the libraries the program needs are copied into appdir/usr/lib. With bwrap it runs
     inside bubblewrap: no network, your home hidden, only the folder holding the AppDir writable."""
@@ -1241,7 +1295,7 @@ def cli(argv):
     """Build from the command line, no window. Prints the path of the AppImage; returns the exit code."""
     import argparse
     p = argparse.ArgumentParser(prog="satchel", description="Build an AppImage from a program file or folder (no window).")
-    p.add_argument("source", help="the program file, the folder that holds the program, or a .deb package, .tar.* archive or .zip file")
+    p.add_argument("source", nargs="?", help="the program file, the folder that holds the program, or a .deb package, .tar.* archive or .zip file")
     p.add_argument("--name", help="app name (default: the file or folder name)")
     p.add_argument("--exe", default="", help="for a folder: the program to start, relative to the folder")
     p.add_argument("--icon", help="a .png or .svg file (default: the best one found inside the folder)")
@@ -1263,8 +1317,23 @@ def cli(argv):
                    help="only start the program for a few seconds to see that it works; builds nothing")
     p.add_argument("--seconds", type=float, default=5, help="with --try: how long to watch the program (default 5)")
     p.add_argument("--dry-run", action="store_true", help="only print the .desktop file and AppRun that would be made; builds nothing")
+    p.add_argument("--install", action="store_true", help="copy Satchel to ~/.local/bin and add it to the app menu; builds nothing")
+    p.add_argument("--uninstall", action="store_true", help="remove what --install made")
     p.add_argument("-v", "--verbose", action="store_true", help="show the output while it runs")
     a = p.parse_args(argv)
+    if a.install or a.uninstall:
+        try:
+            if a.install:
+                dest, entry, note = install_self()
+                print(f"Installed {dest}\nMenu entry {entry}" + (f"\n{note}" if note else ""))
+            else:
+                gone = uninstall_self()
+                print("\n".join(f"Removed {g}" for g in gone) or "Nothing was installed.")
+        except BuildError as e:
+            print(e, file=sys.stderr)
+            return 1
+        return 0
+    if not a.source: p.error("the following arguments are required: source")
     if not is_package(a.source):
         a.category = a.category or "Utility"
         return cli_run(a)
@@ -1371,6 +1440,15 @@ def run_gui():
             page = Adw.PreferencesPage()
             view.set_content(page); self.toasts.set_child(view); self.set_content(self.toasts)
 
+            g = Adw.PreferencesGroup(title="Satchel")
+            self.self_row = Adw.ActionRow(title="Add Satchel to the app menu", use_markup=False)
+            self.self_rm = Gtk.Button(label="Remove", valign=Gtk.Align.CENTER)
+            self.self_rm.connect("clicked", lambda *_: self.menu_self(False))
+            self.self_add = Gtk.Button(valign=Gtk.Align.CENTER, css_classes=["suggested-action"])
+            self.self_add.connect("clicked", lambda *_: self.menu_self(True))
+            self.self_row.add_suffix(self.self_rm); self.self_row.add_suffix(self.self_add)
+            g.add(self.self_row); page.add(g); self.refresh_self()
+
             g = Adw.PreferencesGroup(title="appimagetool", description="The tool that makes the AppImage. Nothing is downloaded unless you press Download (https, from the AppImage project's GitHub releases).")
             self.tool_row = Adw.ActionRow(title="appimagetool", use_markup=False)
             self.use_dl = Gtk.Button(valign=Gtk.Align.CENTER, css_classes=["suggested-action"])
@@ -1467,6 +1545,22 @@ def run_gui():
             keys.add_shortcut(Gtk.Shortcut.new(Gtk.ShortcutTrigger.parse_string("<Control>b"),
                                                Gtk.CallbackAction.new(self.shortcut_build)))
             self.add_controller(keys)
+
+        def refresh_self(self):
+            done = self_installed()
+            self.self_row.set_subtitle(f"In your menu. Copy: {SELF_BIN}/satchel" if done else "Copies Satchel to ~/.local/bin and adds it to your menu")
+            self.self_add.set_label("Update" if done else "Add"); self.self_rm.set_visible(done)
+
+        def menu_self(self, add):
+            try:
+                if add:
+                    dest, _entry, note = install_self()
+                    msg = f"Satchel is in your menu (copy: {dest})"
+                else: uninstall_self(); note, msg = "", "Satchel was removed from your menu"
+            except BuildError as e: self.alert("Could not change the menu", str(e)); return
+            self.refresh_self()
+            if note: self.alert("Done", f"{msg}\n\n{note}")
+            else: self.toasts.add_toast(Adw.Toast(title=msg))
 
         def shortcut_build(self, *_):
             if self.go.get_sensitive(): self.start()

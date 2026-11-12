@@ -7,4 +7,5 @@
 # Usage: satchel                      (opens the window)
 #        satchel PROGRAM [--name N] [--exe E] [--icon I] [--category C] [--version V] [--comment T] [--terminal]
 #                             [--bundle-libs] [--out DIR] [--sandbox] [--try [--seconds S]] [--dry-run] [-v]
+#        satchel --install | --uninstall   (copy to ~/.local/bin and add to / remove from the app menu)
 import collections, glob, hashlib, json, os, platform, re, shlex, shutil, signal, stat, struct, subprocess, sys, tarfile, tempfile, threading, time, unicodedata, zipfile, zlib

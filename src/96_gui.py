@@ -22,6 +22,15 @@ def run_gui():
             page = Adw.PreferencesPage()
             view.set_content(page); self.toasts.set_child(view); self.set_content(self.toasts)
 
+            g = Adw.PreferencesGroup(title="Satchel")
+            self.self_row = Adw.ActionRow(title="Add Satchel to the app menu", use_markup=False)
+            self.self_rm = Gtk.Button(label="Remove", valign=Gtk.Align.CENTER)
+            self.self_rm.connect("clicked", lambda *_: self.menu_self(False))
+            self.self_add = Gtk.Button(valign=Gtk.Align.CENTER, css_classes=["suggested-action"])
+            self.self_add.connect("clicked", lambda *_: self.menu_self(True))
+            self.self_row.add_suffix(self.self_rm); self.self_row.add_suffix(self.self_add)
+            g.add(self.self_row); page.add(g); self.refresh_self()
+
             g = Adw.PreferencesGroup(title="appimagetool", description="The tool that makes the AppImage. Nothing is downloaded unless you press Download (https, from the AppImage project's GitHub releases).")
             self.tool_row = Adw.ActionRow(title="appimagetool", use_markup=False)
             self.use_dl = Gtk.Button(valign=Gtk.Align.CENTER, css_classes=["suggested-action"])
@@ -118,6 +127,22 @@ def run_gui():
             keys.add_shortcut(Gtk.Shortcut.new(Gtk.ShortcutTrigger.parse_string("<Control>b"),
                                                Gtk.CallbackAction.new(self.shortcut_build)))
             self.add_controller(keys)
+
+        def refresh_self(self):
+            done = self_installed()
+            self.self_row.set_subtitle(f"In your menu. Copy: {SELF_BIN}/satchel" if done else "Copies Satchel to ~/.local/bin and adds it to your menu")
+            self.self_add.set_label("Update" if done else "Add"); self.self_rm.set_visible(done)
+
+        def menu_self(self, add):
+            try:
+                if add:
+                    dest, _entry, note = install_self()
+                    msg = f"Satchel is in your menu (copy: {dest})"
+                else: uninstall_self(); note, msg = "", "Satchel was removed from your menu"
+            except BuildError as e: self.alert("Could not change the menu", str(e)); return
+            self.refresh_self()
+            if note: self.alert("Done", f"{msg}\n\n{note}")
+            else: self.toasts.add_toast(Adw.Toast(title=msg))
 
         def shortcut_build(self, *_):
             if self.go.get_sensitive(): self.start()
