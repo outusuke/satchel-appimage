@@ -1007,7 +1007,10 @@ def bundle_libraries(appdir, ident, exe, log=None, cancel=None, bwrap=None):
     prog_tool, share = prepare_tool(tool)       # an AppImage linuxdeploy is unpacked and run as a plain program (see prepare_tool)
     if log: log("Copying libraries in (linuxdeploy)…")
     prog = f"{appdir}/usr/lib/{ident}/{os.path.normpath(exe)}"
-    cmd, env, work = [prog_tool, "--appdir", appdir, "--executable", prog], {**os.environ, "APPIMAGE_EXTRACT_AND_RUN": "1"}, os.path.dirname(appdir)
+    # linuxdeploy parses every --executable as ELF and aborts on anything else, so a launcher script (Chrome's google-chrome-stable
+    # is one) is left out; the ELF files inside the AppDir (chrome, its .so files) are still scanned by linuxdeploy on its own.
+    is_elf = elf_dynamic(os.path.realpath(prog))[2] is not None
+    cmd, env, work = [prog_tool, "--appdir", appdir] + (["--executable", prog] if is_elf else []), {**os.environ, "APPIMAGE_EXTRACT_AND_RUN": "1"}, os.path.dirname(appdir)
     if bwrap:
         base = bwrap_base(bwrap, (share or tool,), work, platform.machine(), os.path.realpath(os.path.expanduser("~")), False)
         cmd = base[:-3] + ["--setenv", "APPIMAGE_EXTRACT_AND_RUN", "1"] + base[-3:] + cmd
