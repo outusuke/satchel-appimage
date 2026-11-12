@@ -1214,7 +1214,15 @@ def make_appdir(src, name, exe, icon, category, terminal, appdir, version="", co
     if icon: shutil.copy2(icon, f"{appdir}/{ident}{ext}")
     else: placeholder_icon(f"{appdir}/{ident}{ext}")
     shutil.copy2(f"{appdir}/{ident}{ext}", f"{appdir}/.DirIcon")
+    # Menu integrators (AppImageLauncher, Gear Lever, appimaged...) look for the icon in the icon theme folder and the .desktop
+    # file under usr/share, not only at the top of the AppDir, so the icon and the desktop file are put there as well.
+    size = png_size(f"{appdir}/{ident}{ext}") if ext == ".png" else None
+    side = size[0] if size and size[0] == size[1] and 16 <= size[0] <= 1024 else 256
+    theme = f"{appdir}/usr/share/icons/hicolor/{'scalable' if ext == '.svg' else f'{side}x{side}'}/apps"
+    os.makedirs(theme, exist_ok=True); shutil.copy2(f"{appdir}/{ident}{ext}", f"{theme}/{ident}{ext}")
+    os.makedirs(f"{appdir}/usr/share/applications", exist_ok=True)
     with open(f"{appdir}/{ident}.desktop", "w") as f: f.write(desktop_file(ident, name, category, terminal, version, comment))
+    shutil.copy2(f"{appdir}/{ident}.desktop", f"{appdir}/usr/share/applications/{ident}.desktop")
     if bundle: bundle_libraries(appdir, ident, exe, log, cancel, bwrap)
     with open(f"{appdir}/AppRun", "w") as f: f.write(apprun_script(ident, exe, app_libs(src, exe), usr_layout(src, exe), bundle, None if data is None else data_copies(src, exe, data)))
     os.chmod(f"{appdir}/AppRun", 0o755)

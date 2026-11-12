@@ -213,6 +213,15 @@ class Logic(unittest.TestCase):
         M["make_appdir"](d, "x", "inner_run", None, "Utility", False, ad)
         self.assertTrue(os.path.islink(f"{ad}/usr/lib/x/inner_run"))
 
+    def test_the_icon_is_also_put_in_the_icon_theme_folder_and_the_desktop_file_in_usr_share(self):
+        d = self.prog_folder(); ic = f"{self.t}/ic.png"; M["placeholder_icon"](ic)
+        ad = f"{self.t}/AD1"; M["make_appdir"](d, "My App", "bin/run", ic, "Utility", False, ad)
+        self.assertEqual(get(f"{ad}/usr/share/icons/hicolor/256x256/apps/My_App.png", "rb"), get(ic, "rb"))
+        self.assertEqual(get(f"{ad}/usr/share/applications/My_App.desktop"), get(f"{ad}/My_App.desktop"))
+        sv = f"{self.t}/i.svg"; put(sv, "<svg xmlns='http://www.w3.org/2000/svg'/>")
+        ad = f"{self.t}/AD2"; M["make_appdir"](d, "My App", "bin/run", sv, "Utility", False, ad)
+        self.assertTrue(os.path.isfile(f"{ad}/usr/share/icons/hicolor/scalable/apps/My_App.svg"))
+
     def test_exe_names_that_merely_start_with_dots_are_allowed(self):
         d = self.prog_folder(); script(f"{d}/..odd", "echo odd\n"); ad = f"{self.t}/AD"
         M["make_appdir"](d, "x", "..odd", None, "Utility", False, ad)
