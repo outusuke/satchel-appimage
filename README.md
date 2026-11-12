@@ -4,6 +4,8 @@ A small GTK4 + libadwaita front end for `appimagetool`: pick a program (a file, 
 build an `.AppImage`. It packs exactly what you give it. It does **not** copy in shared libraries unless you switch on **Bundle libraries**, so the result
 runs only where those libraries exist (the program warns you about libraries it can see are missing).
 
+![satchel window](docs/screenshot.png)
+
 ## Needs
 
 - Python 3, PyGObject, GTK 4, libadwaita (for the window only; the command line needs just Python 3)
