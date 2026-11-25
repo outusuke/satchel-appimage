@@ -82,11 +82,12 @@ def run_gui(path=None):
             if self.saved.get("category"): self.cat_row.set_selected(CATEGORIES.index(self.saved["category"]))
             self.term_row = Adw.SwitchRow(title="Runs in a terminal", active=self.saved.get("terminal", False))
             self.bundle_row = Adw.SwitchRow(title="Bundle libraries (linuxdeploy)", active=False, sensitive=False)
-            self.data_row = Adw.SwitchRow(title="Let the program save files (writable data folder)", active=False, use_markup=False,
-                                          subtitle="Turn on if the program saves settings, downloads or other files next to itself "
-                                                   "(it fails or loses them otherwise, because an AppImage is read-only). "
-                                                   "It then runs from ~/.local/share/<app name>, where it can write, "
-                                                   "and what it saves stays there. Leave off if it only reads its files.")
+            self.data_row = Adw.SwitchRow(title="Let the program save files (writable data folder)", active=False)
+            self.data_row.set_use_markup(False)
+            self.data_row.set_subtitle("Turn on if the program saves settings, downloads or other files next to itself "
+                                 "(it fails or loses them otherwise, because an AppImage is read-only). "
+                                 "It then runs from ~/.local/share/<app name>, where it can write, "
+                                 "and what it saves stays there. Leave off if it only reads its files.")
             self.writ_row = Adw.EntryRow(title="Advanced: big files the program edits in place (usually leave empty)", visible=False,
                                          tooltip_text="Only for a program that changes a large existing file in place, such as a database. "
                                                       "Paths inside the program folder, separated by commas, e.g. data/big.db. "
