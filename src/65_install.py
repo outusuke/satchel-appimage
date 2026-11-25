@@ -8,6 +8,9 @@ def desktop_exec(path):
     return '"' + re.sub(r'(["`$\\])', r"\\\1", path).replace("%", "%%") + '"'
 
 
+DEB_MIME = "application/vnd.debian.binary-package;application/x-debian-package;application/x-deb;"
+
+
 def install_self(src=None, bin_dir=None, apps_dir=None):
     """Put Satchel itself in your local binaries (~/.local/bin/satchel) and add it to the app menu (a satchel.desktop file in
     ~/.local/share/applications that starts that copy). src is the Satchel file to copy (default: the one running). Safe to repeat:
@@ -23,7 +26,8 @@ def install_self(src=None, bin_dir=None, apps_dir=None):
             with open(dest + ".new", "wb") as f: f.write(data)
             os.chmod(dest + ".new", 0o755); os.replace(dest + ".new", dest)
         text = ("[Desktop Entry]\nType=Application\nName=Satchel\nComment=Build an AppImage from a program file or folder\n"
-                f"Exec={desktop_exec(dest)}\nIcon=package-x-generic\nCategories=Utility;\nTerminal=false\n")
+                f"Exec={desktop_exec(dest)} --open %f\nIcon=package-x-generic\nCategories=Utility;\nTerminal=false\n")
+        if is_debian(): text += f"MimeType={DEB_MIME}\n"           # lets file managers offer Satchel for .deb
         with open(entry + ".new", "w") as f: f.write(text)
         os.replace(entry + ".new", entry)
     except OSError as e: raise BuildError(f"Could not install Satchel: {e}")

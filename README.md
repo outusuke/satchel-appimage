@@ -24,7 +24,10 @@ seconds. **Ctrl+B** builds.
 
 The **Satchel** section at the top of the window copies Satchel to `~/.local/bin/satchel` and adds a `satchel.desktop` entry in
 `~/.local/share/applications` that starts that copy (**Add**; **Update** after a new version; **Remove** undoes both).
-On the command line: `satchel --install` and `satchel --uninstall`. If `~/.local/bin` is not in your `PATH` you are told; the menu
+On the command line: `satchel --install` and `satchel --uninstall`.
+On Debian and its relatives (Ubuntu, Mint, ...; detected from `/etc/os-release`) the menu entry also lists Satchel under **Open With** for `.deb` files:
+right-click a `.deb` in your file manager, choose Satchel, and the window opens with the package loaded, ready to build an AppImage
+(`satchel --open FILE` does the same from a terminal). Run **Update** once to add this to an entry made by an older Satchel. If `~/.local/bin` is not in your `PATH` you are told; the menu
 entry works either way.
 
 ## Packages and archives

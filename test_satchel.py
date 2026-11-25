@@ -895,7 +895,7 @@ class Logic(unittest.TestCase):
         src = script(f"{self.t}/satchel-src", "echo hi\n"); b, a = f"{self.t}/h/bin", f"{self.t}/h/apps"
         dest, entry, note = M["install_self"](src, b, a)
         self.assertEqual(dest, f"{b}/satchel"); self.assertTrue(os.access(dest, os.X_OK)); self.assertEqual(get(dest), get(src))
-        d = get(entry); self.assertIn(f"Exec={dest}\n", d); self.assertIn("Name=Satchel\n", d); self.assertIn("Categories=Utility;", d)
+        d = get(entry); self.assertIn(f"Exec={dest} --open %f\n", d); self.assertIn("Name=Satchel\n", d); self.assertIn("Categories=Utility;", d)
         self.assertIn("PATH", note)                                              # the test bin folder is not in PATH
         put(src, "#!/bin/sh\necho new\n"); M["install_self"](src, b, a); self.assertIn("new", get(dest))     # repeating replaces the copy
         M["install_self"](dest, b, a); self.assertIn("new", get(dest))          # installing the installed copy keeps it
@@ -906,7 +906,16 @@ class Logic(unittest.TestCase):
 
     def test_install_self_quotes_a_path_with_spaces_in_the_menu_entry(self):
         src = script(f"{self.t}/s", "exit 0\n"); dest, entry, _ = M["install_self"](src, f"{self.t}/my bin", f"{self.t}/apps")
-        self.assertIn(f'Exec="{dest}"\n', get(entry))
+        self.assertIn(f'Exec="{dest}" --open %f\n', get(entry))
+
+    def test_menu_entry_offers_open_with_for_deb_only_on_debian_like_systems(self):
+        src = script(f"{self.t}/s", "exit 0\n"); osr = f"{self.t}/os-release"; M["OS_RELEASE"] = osr
+        for text, want in (("ID=ubuntu\nID_LIKE=debian\n", True), ("ID=debian\n", True), ('ID=linuxmint\nID_LIKE="ubuntu debian"\n', True),
+                           ("ID=fedora\n", False), ("ID=arch\n", False)):
+            put(osr, text); self.assertEqual(M["is_debian"](), want, text)
+            _, entry, _ = M["install_self"](src, f"{self.t}/b", f"{self.t}/a")
+            self.assertEqual("MimeType=application/vnd.debian.binary-package;" in get(entry), want, text)
+        os.remove(osr); self.assertFalse(M["is_debian"]())
 
     def test_cli_install_and_uninstall(self):
         M["SELF_BIN"], M["SELF_APPS"], M["__file__"] = f"{self.t}/b", f"{self.t}/a", script(f"{self.t}/satchel", "exit 0\n")

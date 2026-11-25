@@ -1,5 +1,5 @@
 # ---- window (GTK is loaded only here, so the functions above can be tested without it) ----
-def run_gui():
+def run_gui(path=None):
     import gi
     gi.require_version("Gtk", "4.0"); gi.require_version("Adw", "1")
     from gi.repository import Adw, Gdk, Gio, GLib, Gtk
@@ -461,6 +461,10 @@ def run_gui():
 
     class App(Adw.Application):
         def __init__(self): super().__init__()                  # no application id: not needed, only gives single-instance and D-Bus
-        def do_activate(self): (self.props.active_window or Win(self)).present()
+        def do_activate(self):
+            first = not self.props.active_window
+            win = self.props.active_window or Win(self)
+            win.present()
+            if first and path and os.path.exists(path): win.set_source(os.path.abspath(path))
 
     return App().run(sys.argv[:1])

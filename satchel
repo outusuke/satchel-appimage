@@ -35,8 +35,8 @@ class Cancelled(BuildError):
 OS_RELEASE = "/etc/os-release"
 
 
-def install_hint(pkg):
-    """The command that installs pkg on this distribution, guessed from /etc/os-release (dnf when unknown)."""
+def distro_ids():
+    """The ID and ID_LIKE words from /etc/os-release, lower case."""
     ids = []
     try:
         with open(OS_RELEASE) as f:
@@ -44,7 +44,17 @@ def install_hint(pkg):
                 k, _, v = line.partition("=")
                 if k in ("ID", "ID_LIKE"): ids += v.strip().strip('"').lower().split()
     except OSError: pass
-    for i in ids:
+    return ids
+
+
+def is_debian():
+    """True on Debian and its relatives."""
+    return any(i in ("debian", "ubuntu") for i in distro_ids())
+
+
+def install_hint(pkg):
+    """The command that installs pkg on this distribution, guessed from /etc/os-release (dnf when unknown)."""
+    for i in distro_ids():
         if i in ("debian", "ubuntu"): return f"sudo apt install {pkg}"
         if i in ("arch", "manjaro"): return f"sudo pacman -S {pkg}"
         if i in ("suse", "sles") or i.startswith("opensuse"): return f"sudo zypper install {pkg}"
@@ -1009,6 +1019,9 @@ def desktop_exec(path):
     return '"' + re.sub(r'(["`$\\])', r"\\\1", path).replace("%", "%%") + '"'
 
 
+DEB_MIME = "application/vnd.debian.binary-package;application/x-debian-package;application/x-deb;"
+
+
 def install_self(src=None, bin_dir=None, apps_dir=None):
     """Put Satchel itself in your local binaries (~/.local/bin/satchel) and add it to the app menu (a satchel.desktop file in
     ~/.local/share/applications that starts that copy). src is the Satchel file to copy (default: the one running). Safe to repeat:
@@ -1024,7 +1037,8 @@ def install_self(src=None, bin_dir=None, apps_dir=None):
             with open(dest + ".new", "wb") as f: f.write(data)
             os.chmod(dest + ".new", 0o755); os.replace(dest + ".new", dest)
         text = ("[Desktop Entry]\nType=Application\nName=Satchel\nComment=Build an AppImage from a program file or folder\n"
-                f"Exec={desktop_exec(dest)}\nIcon=package-x-generic\nCategories=Utility;\nTerminal=false\n")
+                f"Exec={desktop_exec(dest)} --open %f\nIcon=package-x-generic\nCategories=Utility;\nTerminal=false\n")
+        if is_debian(): text += f"MimeType={DEB_MIME}\n"           # lets file managers offer Satchel for .deb
         with open(entry + ".new", "w") as f: f.write(text)
         os.replace(entry + ".new", entry)
     except OSError as e: raise BuildError(f"Could not install Satchel: {e}")
@@ -1425,7 +1439,7 @@ def save_settings(data, path=None):
 
 
 # ---- window (GTK is loaded only here, so the functions above can be tested without it) ----
-def run_gui():
+def run_gui(path=None):
     import gi
     gi.require_version("Gtk", "4.0"); gi.require_version("Adw", "1")
     from gi.repository import Adw, Gdk, Gio, GLib, Gtk
@@ -1887,13 +1901,18 @@ def run_gui():
 
     class App(Adw.Application):
         def __init__(self): super().__init__()                  # no application id: not needed, only gives single-instance and D-Bus
-        def do_activate(self): (self.props.active_window or Win(self)).present()
+        def do_activate(self):
+            first = not self.props.active_window
+            win = self.props.active_window or Win(self)
+            win.present()
+            if first and path and os.path.exists(path): win.set_source(os.path.abspath(path))
 
     return App().run(sys.argv[:1])
 
 
 def main(argv):
     if not argv: return run_gui()
+    if argv[0] == "--open": return run_gui(argv[1] if len(argv) > 1 and argv[1] else None)    # used by the menu entry's Open With
     try: return cli(argv)
     except KeyboardInterrupt:
         print("Stopped.", file=sys.stderr)

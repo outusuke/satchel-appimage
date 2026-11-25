@@ -22,8 +22,8 @@ class Cancelled(BuildError):
 OS_RELEASE = "/etc/os-release"
 
 
-def install_hint(pkg):
-    """The command that installs pkg on this distribution, guessed from /etc/os-release (dnf when unknown)."""
+def distro_ids():
+    """The ID and ID_LIKE words from /etc/os-release, lower case."""
     ids = []
     try:
         with open(OS_RELEASE) as f:
@@ -31,7 +31,17 @@ def install_hint(pkg):
                 k, _, v = line.partition("=")
                 if k in ("ID", "ID_LIKE"): ids += v.strip().strip('"').lower().split()
     except OSError: pass
-    for i in ids:
+    return ids
+
+
+def is_debian():
+    """True on Debian and its relatives."""
+    return any(i in ("debian", "ubuntu") for i in distro_ids())
+
+
+def install_hint(pkg):
+    """The command that installs pkg on this distribution, guessed from /etc/os-release (dnf when unknown)."""
+    for i in distro_ids():
         if i in ("debian", "ubuntu"): return f"sudo apt install {pkg}"
         if i in ("arch", "manjaro"): return f"sudo pacman -S {pkg}"
         if i in ("suse", "sles") or i.startswith("opensuse"): return f"sudo zypper install {pkg}"
