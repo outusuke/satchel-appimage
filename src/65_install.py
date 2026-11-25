@@ -26,8 +26,8 @@ def install_self(src=None, bin_dir=None, apps_dir=None):
             with open(dest + ".new", "wb") as f: f.write(data)
             os.chmod(dest + ".new", 0o755); os.replace(dest + ".new", dest)
         text = ("[Desktop Entry]\nType=Application\nName=Satchel\nComment=Build an AppImage from a program file or folder\n"
-                f"Exec={desktop_exec(dest)} --open %f\nIcon=package-x-generic\nCategories=Utility;\nTerminal=false\n")
-        if is_debian(): text += f"MimeType={DEB_MIME}\n"           # lets file managers offer Satchel for .deb
+                f"Exec={desktop_exec(dest)} --open %f\nIcon=package-x-generic\nCategories=Utility;\nTerminal=false\n"
+                f"MimeType={DEB_MIME}\n")
         with open(entry + ".new", "w") as f: f.write(text)
         os.replace(entry + ".new", entry)
     except OSError as e: raise BuildError(f"Could not install Satchel: {e}")

@@ -34,11 +34,6 @@ def distro_ids():
     return ids
 
 
-def is_debian():
-    """True on Debian and its relatives."""
-    return any(i in ("debian", "ubuntu") for i in distro_ids())
-
-
 def install_hint(pkg):
     """The command that installs pkg on this distribution, guessed from /etc/os-release (dnf when unknown)."""
     for i in distro_ids():
