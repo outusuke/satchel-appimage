@@ -9,6 +9,8 @@ TOOL_URL = "https://github.com/AppImage/appimagetool/releases"
 
 
 APP_VERSION = "1.1"
+REPO_URL = "https://github.com/outusuke/satchel-appimage"
+DEVELOPER = "outusuke"
 
 
 class BuildError(Exception):

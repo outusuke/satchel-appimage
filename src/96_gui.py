@@ -16,8 +16,10 @@ def run_gui(path=None):
             self.cancel_ev = None                       # set while a build runs; the Build button is Cancel then
             self.toasts = Adw.ToastOverlay()
             bar = Adw.HeaderBar()
-            about = Gtk.Button(icon_name="help-about-symbolic", tooltip_text="About", css_classes=["flat"])
-            about.connect("clicked", lambda *_: self.about()); bar.pack_end(about)
+            act = Gio.SimpleAction.new("about", None)
+            act.connect("activate", lambda *_: self.about()); self.add_action(act)
+            menu = Gio.Menu(); menu.append("About Satchel", "win.about")
+            bar.pack_end(Gtk.MenuButton(icon_name="open-menu-symbolic", tooltip_text="Main menu", menu_model=menu))
             view = Adw.ToolbarView(); view.add_top_bar(bar)
             page = Adw.PreferencesPage()
             view.set_content(page); self.toasts.set_child(view); self.set_content(self.toasts)
@@ -150,7 +152,9 @@ def run_gui(path=None):
             return True
 
         def about(self):
-            kw = dict(application_name="Satchel", version=APP_VERSION, license_type=Gtk.License.GPL_3_0,
+            kw = dict(application_name="Satchel", application_icon="package-x-generic", version=APP_VERSION,
+                      developer_name=DEVELOPER, developers=[DEVELOPER], website=REPO_URL, issue_url=REPO_URL + "/issues",
+                      license_type=Gtk.License.GPL_3_0,
                       comments="Pick a program, name it, pick an icon, build an AppImage. It packs exactly what you give it.")
             try: Adw.AboutDialog(**kw).present(self)
             except AttributeError: Adw.AboutWindow(transient_for=self, **kw).present()      # older libadwaita
